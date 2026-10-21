@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "turbo3.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
@@ -142,6 +143,23 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
         }
     }
 
+    return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f32(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const float2 * K_f2 = (const float2 *) K_c;
+    const float2 * Q_f2 = (const float2 *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = threadIdx.x % nthreads; i < D/2; i += nthreads) {
+        ggml_cuda_mad(sum, K_f2[i], Q_f2[i/nthreads]);
+    }
     return sum;
 }
 
@@ -373,6 +391,12 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
 }
 
 typedef void (*dequantize_V_t)(const void *, void *, const int64_t);
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_f32(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(std::is_same_v<T, float>, "F32 V only supports float output");
+    ggml_cuda_memcpy_1<ne*sizeof(float)>(dst, (const float *) vx + i0);
+}
 
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
@@ -622,9 +646,86 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// Turbo3 KQ uses the float-Q path: dequantize the two packed cache values
+// addressed by each Q pair, then accumulate in FP32.  The D=512 instance
+// always divides this loop's logical 32-lane partition exactly.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
+        const char * __restrict__ K_c, const void * __restrict__ Q_v,
+        const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_turbo3_0 * K = (const block_turbo3_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb/4;
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k0 = 0; k0 < D/2; k0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k1 = 0; k1 < cpy_ne; ++k1) {
+            const int pair = k0 + (threadIdx.x % nthreads)*cpy_ne + k1;
+            const int element = 2*pair;
+            const int block = element/QK_TURBO3;
+            const int within = element % QK_TURBO3;
+            const float norm = __half2float(K[block].norm);
+            const uint8_t low = K[block].qs[within/4];
+            const uint8_t sign = K[block].signs[within/8];
+            const int shift = (within % 4)*2;
+            const uint8_t i0 = ((low >> shift) & 0x3) | (((sign >> (within % 8)) & 0x1) << 2);
+            const uint8_t i1 = ((low >> (shift + 2)) & 0x3) | (((sign >> (within % 8 + 1)) & 0x1) << 2);
+            const float2 kv = make_float2(TURBO3_CENTROIDS[i0]*norm, TURBO3_CENTROIDS[i1]*norm);
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 q = ((const half2 *) Q_v)[k0/nthreads + k1];
+            ggml_cuda_mad(sum, kv, __half22float2(q));
+#else
+            const float2 q = ((const float2 *) Q_v)[k0/nthreads + k1];
+            sum += kv.x*q.x + kv.y*q.y;
+#endif
+        }
+    }
+    return sum;
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    const int64_t block = i0/QK_TURBO3;
+    const int within = i0 % QK_TURBO3;
+    const float norm = __half2float(x[block].norm);
+    static_assert(ne == 4, "Turbo3 D=512 VEC path uses four values per lane");
+
+    const uint8_t low = x[block].qs[within/4];
+    const uint8_t sign = x[block].signs[within/8];
+    const int sign_shift = within % 8;
+    const uint8_t indices[4] = {
+        (uint8_t) (((low >> 0) & 0x3) | (((sign >> (sign_shift + 0)) & 0x1) << 2)),
+        (uint8_t) (((low >> 2) & 0x3) | (((sign >> (sign_shift + 1)) & 0x1) << 2)),
+        (uint8_t) (((low >> 4) & 0x3) | (((sign >> (sign_shift + 2)) & 0x1) << 2)),
+        (uint8_t) (((low >> 6) & 0x3) | (((sign >> (sign_shift + 3)) & 0x1) << 2)),
+    };
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        ((half2 *) dst)[0] = make_half2(__float2half(TURBO3_CENTROIDS[indices[0]]*norm), __float2half(TURBO3_CENTROIDS[indices[1]]*norm));
+        ((half2 *) dst)[1] = make_half2(__float2half(TURBO3_CENTROIDS[indices[2]]*norm), __float2half(TURBO3_CENTROIDS[indices[3]]*norm));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        ((float2 *) dst)[0] = make_float2(TURBO3_CENTROIDS[indices[0]]*norm, TURBO3_CENTROIDS[indices[1]]*norm);
+        ((float2 *) dst)[1] = make_float2(TURBO3_CENTROIDS[indices[2]]*norm, TURBO3_CENTROIDS[indices[3]]*norm);
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported Turbo3 V destination");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
-    if constexpr (type_K == GGML_TYPE_F16) {
+    if constexpr (type_K == GGML_TYPE_F32) {
+        return vec_dot_fattn_vec_KQ_f32<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
@@ -638,6 +739,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+        return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -646,7 +749,9 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
 
 template <ggml_type type_V, typename T, int ne>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
-    if constexpr (type_V == GGML_TYPE_F16) {
+    if constexpr (type_V == GGML_TYPE_F32) {
+        return dequantize_V_f32<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_0) {
         return dequantize_V_q4_0<T, ne>;
@@ -660,6 +765,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+        return dequantize_V_turbo3_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

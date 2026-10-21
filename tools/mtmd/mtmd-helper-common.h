@@ -9,7 +9,9 @@
 #include "llama-cpp.h"
 #include "mtmd.h"
 
+#include <algorithm>
 #include <cstdarg>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -95,6 +97,23 @@ struct decode_embd_batch {
         for (int i = 0; i < n_tokens; i++) {
             pos[i] = pos_0 + i;
         }
+    }
+
+    void set_position_external(const llama_pos * pos_soa, llama_pos pos_base, llama_seq_id seq_id) {
+        GGML_ASSERT(pos_soa != nullptr);
+        this->seq_id = seq_id;
+        std::memcpy(pos.data(), pos_soa, pos.size() * sizeof(llama_pos));
+        const llama_pos min_lane_0 = *std::min_element(pos.begin(), pos.begin() + n_tokens);
+        if (min_lane_0 < pos_base) {
+            const int lanes_to_offset = std::min(n_pos_per_embd, 3);
+            for (int lane = 0; lane < lanes_to_offset; ++lane) {
+                const size_t lane_offset = (size_t) lane * n_tokens;
+                for (int i = 0; i < n_tokens; ++i) {
+                    pos[lane_offset + i] += pos_base;
+                }
+            }
+        }
+        std::fill(logits.begin(), logits.end(), false);
     }
 
     // M-RoPE for image

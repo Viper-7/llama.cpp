@@ -157,4 +157,6 @@ const ggml_backend_device_i ggml_backend_remoting_device_interface = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .event_new_timing     = */ NULL,
+    /* .event_elapsed_time   = */ NULL,
 };

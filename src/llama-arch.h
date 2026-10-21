@@ -94,6 +94,7 @@ enum llm_arch {
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
     LLM_ARCH_GLM_DSA,
+    LLM_ARCH_GLM5NEXT,
     LLM_ARCH_BITNET,
     LLM_ARCH_T5,
     LLM_ARCH_T5ENCODER,
@@ -157,6 +158,7 @@ enum llm_arch {
     LLM_ARCH_MAINCODER,
     LLM_ARCH_MAION_CODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_ZAYA,
     LLM_ARCH_KIMI_K3,
     LLM_ARCH_GLM5_NEXT,
     LLM_ARCH_TALKIE,
@@ -589,6 +591,18 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
+    LLM_TENSOR_CCA_CONV_GRP,        // zaya: grouped conv1d
+    LLM_TENSOR_CCA_K_SCALE,         // zaya: learned K temperature
+    LLM_TENSOR_CCA_VAL_PROJ1,       // zaya: V projection 1
+    LLM_TENSOR_CCA_VAL_PROJ2,       // zaya: V projection 2
+    LLM_TENSOR_RES_SCALE_HS,        // zaya: hidden-state residual scale
+    LLM_TENSOR_RES_SCALE_RES,       // zaya: residual stream scale
+    LLM_TENSOR_RES_SCALE_HS_FINAL,  // zaya: final hidden-state residual scale
+    LLM_TENSOR_RES_SCALE_RES_FINAL, // zaya: final residual stream scale
+    LLM_TENSOR_ZAYA_ROUTER_MLP2,    // zaya: router MLP layer 2
+    LLM_TENSOR_ZAYA_ROUTER_MLP4,    // zaya: router MLP output
+    LLM_TENSOR_ZAYA_ROUTER_BIASES,  // zaya: router balancing biases
+    LLM_TENSOR_ZAYA_ROUTER_EDA_SCALE,
     LLM_TENSOR_SSM_G,               // kimi-k3: full-rank KDA gate
     LLM_TENSOR_ATTN_RES_SCORE,      // kimi-k3: fused res_norm*res_proj (pre-attn)
     LLM_TENSOR_FFN_RES_SCORE,       // kimi-k3: fused res_norm*res_proj (pre-ffn)

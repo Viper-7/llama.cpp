@@ -239,18 +239,22 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 if (item.at("content").empty()) {
                     throw std::invalid_argument("item['content'] is empty");
                 }
-                if (!exists_and_is_string(item.at("content")[0], "text")) {
-                    throw std::invalid_argument("item['content']['text'] is not a string");
+                std::string reasoning;
+                for (const auto & part : item.at("content")) {
+                    if (!exists_and_is_string(part, "text") || part.value("type", "reasoning_text") != "reasoning_text") {
+                        throw std::invalid_argument("reasoning content requires plaintext reasoning_text parts");
+                    }
+                    reasoning += part.at("text").get<std::string>();
                 }
 
                 if (merge_prev) {
                     auto & prev_msg = chatcmpl_messages.back();
-                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                    prev_msg["reasoning_content"] = prev_msg.value("reasoning_content", std::string{}) + reasoning;
                 } else {
                     chatcmpl_messages.push_back(json {
                         {"role", "assistant"},
                         {"content", json::array()},
-                        {"reasoning_content", item.at("content")[0].at("text")},
+                        {"reasoning_content", reasoning},
                     });
                 }
             } else {
@@ -261,6 +265,12 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("'input' must be a string or array of objects");
     }
 
+    if (json_value(response_body, "prefill_only", false)) {
+        if (chatcmpl_messages.empty() || chatcmpl_messages.back().value("role", "") != "user") {
+            throw std::invalid_argument("prefill_only requires a final user message");
+        }
+        chatcmpl_body["add_generation_prompt"] = false;
+    }
     chatcmpl_body["messages"] = chatcmpl_messages;
 
     if (response_body.contains("tools")) {

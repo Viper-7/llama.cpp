@@ -136,14 +136,26 @@ int32_t mtmd_helper_decode_image_chunk(
 
     const llama_model * model = llama_get_model(lctx);
     int n_mmproj_embd = llama_model_n_embd_inp(model);
-    int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
+    const float * ext_embd = mtmd_input_chunk_get_embd(chunk);
+    const llama_pos * ext_pos = mtmd_input_chunk_get_pos(chunk);
+    const int32_t ext_n_pos_per_embd = mtmd_input_chunk_get_n_pos_per_embd(chunk);
+    const size_t ext_n_embd = mtmd_input_chunk_get_n_embd(chunk);
+    const bool use_external = ext_embd && ext_pos && ext_n_pos_per_embd > 0 && ext_n_embd > 0;
+    if (use_external && (int) ext_n_embd != n_mmproj_embd) {
+        LOG_ERR("external embedding dimension mismatch: expected %d, got %zu\n", n_mmproj_embd, ext_n_embd);
+        return -1;
+    }
+    int n_pos_per_embd = use_external ? ext_n_pos_per_embd : (mtmd_decode_use_mrope(ctx) ? 4 : 1);
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
-    decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
+    decode_embd_batch batch_embd(use_external ? const_cast<float *>(ext_embd) : encoded_embd,
+                                 n_tokens, n_pos_per_embd, n_mmproj_embd);
 
-    if (mtmd_decode_use_mrope(ctx)) {
+    if (use_external) {
+        batch_embd.set_position_external(ext_pos, n_past, seq_id);
+    } else if (mtmd_decode_use_mrope(ctx)) {
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
             const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
             if (!image_tokens) {

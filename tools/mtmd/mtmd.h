@@ -134,7 +134,15 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct llama_model * text_model,
                                             const struct mtmd_context_params ctx_params);
 
+// Initialize tokenization/decoding support for externally produced media
+// embeddings without loading a local multimodal projector.
+MTMD_API mtmd_context * mtmd_init_from_text_model(const struct llama_model * text_model,
+                                                  const struct mtmd_context_params ctx_params);
+
 MTMD_API void mtmd_free(mtmd_context * ctx);
+
+MTMD_API void         mtmd_set_visiontower_url(mtmd_context * ctx, const char * url);
+MTMD_API const char * mtmd_get_visiontower_url(const mtmd_context * ctx);
 
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk
@@ -174,6 +182,17 @@ MTMD_API const char * mtmd_get_marker(const mtmd_context * ctx);
 //     note: passing a placeholder bitmap to mtmd_encode() will return an error
 MTMD_API mtmd_bitmap *         mtmd_bitmap_init           (uint32_t nx, uint32_t ny, const unsigned char * data);
 MTMD_API mtmd_bitmap *         mtmd_bitmap_init_from_audio(size_t n_samples,         const float         * data);
+// Create a media object backed by pre-encoded embeddings and decoder positions.
+// embd is row-major [n_tokens, n_embd]; pos is SoA
+// [n_pos_per_embd, n_tokens]. Both inputs are copied.
+MTMD_API mtmd_bitmap *         mtmd_bitmap_init_from_embd(uint32_t n_tokens,
+                                                          llama_pos n_pos,
+                                                          int32_t n_pos_per_embd,
+                                                          const float * embd,
+                                                          size_t n_embd,
+                                                          const llama_pos * pos,
+                                                          bool is_video,
+                                                          bool use_non_causal);
 MTMD_API uint32_t              mtmd_bitmap_get_nx     (const mtmd_bitmap * bitmap);
 MTMD_API uint32_t              mtmd_bitmap_get_ny     (const mtmd_bitmap * bitmap);
 MTMD_API const unsigned char * mtmd_bitmap_get_data   (const mtmd_bitmap * bitmap);
@@ -237,6 +256,11 @@ MTMD_API size_t                     mtmd_input_chunk_get_n_tokens    (const mtmd
 MTMD_API const char *               mtmd_input_chunk_get_id          (const mtmd_input_chunk * chunk);
 // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd_input_chunk * chunk);
+MTMD_API const float *              mtmd_input_chunk_get_embd          (const mtmd_input_chunk * chunk);
+MTMD_API size_t                     mtmd_input_chunk_get_n_embd        (const mtmd_input_chunk * chunk);
+MTMD_API const llama_pos *          mtmd_input_chunk_get_pos           (const mtmd_input_chunk * chunk);
+MTMD_API int32_t                    mtmd_input_chunk_get_n_pos_per_embd(const mtmd_input_chunk * chunk);
+MTMD_API bool                       mtmd_input_chunk_get_use_non_causal(const mtmd_input_chunk * chunk);
 
 // in case you want to use custom logic to handle the chunk (i.e. KV cache management)
 // you can move the chunk ownership to your own code by copying it

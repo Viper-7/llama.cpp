@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-route-stats.h"
 #include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
@@ -14,6 +15,8 @@
 
 #include <array>
 #include <map>
+#include <deque>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -87,9 +90,24 @@ struct llama_context {
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
+    const std::map<int32_t, std::vector<float>> & get_hidden_states() const;
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+
+    // Queue a device-resident hidden-state row range from the most recent
+    // NextN output of src to the next native-MTP decode input. Returns false
+    // when the source rows are not resident in the current graph result.
+    bool set_nextn_input_from(
+            const llama_context & src,
+                       int32_t     src_row,
+                       int32_t     dst_row,
+                       int32_t     n_rows);
+
+    void set_nextn_host_output(bool enabled);
+    bool preserve_nextn_ith(int32_t i);
+    bool copy_nextn_ith(int32_t i, float * dst, size_t n_floats);
+    bool copy_nextn_carry(float * dst, size_t n_floats);
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -118,6 +136,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_hidden_state_layers(const std::set<int32_t> & layers);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
@@ -161,8 +180,10 @@ struct llama_context {
     size_t state_set_data(const uint8_t * src, size_t size);
 
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_get_size_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_get_data_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(
@@ -242,6 +263,9 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_moe_routes(const llm_graph_result * res);
+    void consume_moe_routes();
+    void report_moe_routes();
 
     //
     // graph
@@ -286,11 +310,16 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
+    void record_nextn_transport(ggml_backend_t backend, size_t bytes, int64_t submit_start_us);
+    void apply_nextn_device_inputs(llm_graph_result * res);
+    int decode_impl(const llama_batch_ext & batch_inp);
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_write_data_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     //
@@ -321,10 +350,75 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
+    struct nextn_transport_info {
+        uint64_t copies    = 0;
+        uint64_t bytes     = 0;
+        int64_t  submit_us = 0;
+        std::string backend;
+    } nextn_transport;
+
+    struct nextn_device_output_info {
+        ggml_tensor * tensor     = nullptr;
+        ggml_backend_t backend   = nullptr;
+        int32_t row_offset       = 0;
+        int32_t n_rows           = 0;
+        uint64_t generation      = 0;
+    } nextn_device_output;
+
+    struct nextn_device_input_span {
+        const llama_context * src = nullptr;
+        int32_t src_row            = 0;
+        int32_t dst_row            = 0;
+        int32_t n_rows             = 0;
+        uint64_t generation        = 0;
+        bool use_carry             = false;
+    };
+    std::vector<nextn_device_input_span> nextn_device_inputs;
+
+    bool validate_nextn_device_input(
+            const nextn_device_input_span & span,
+            ggml_tensor * dst,
+            ggml_backend_t backend_dst) const;
+    bool nextn_device_inputs_cover(llm_graph_result * res, int32_t n_rows) const;
+    bool prepare_nextn_device_inputs_for_reset(const llama_ubatch & ubatch);
+    bool recover_nextn_self_inputs_to_host(const llama_ubatch & ubatch);
+    bool preserve_nextn_output_row(int32_t row);
+    void synchronize_nextn_device_carry();
+
+    struct nextn_device_input_transport_info {
+        uint64_t copies    = 0;
+        uint64_t aliases   = 0;
+        uint64_t bytes     = 0;
+        int64_t  submit_us = 0;
+        std::string routes;
+    } nextn_device_input_transport;
+
+    struct nextn_device_carry_info {
+        std::vector<uint8_t> meta;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        nextn_device_output_info output;
+        bool valid = false;
+        bool pending = false;
+    } nextn_device_carry;
+
+    bool nextn_host_output = true;
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+
+    struct moe_route_snapshot {
+        int32_t layer = -1;
+        size_t n_used = 0;
+        size_t n_tokens = 0;
+        std::vector<int32_t> ids;
+    };
+    std::deque<moe_route_snapshot> moe_route_pending;
+    size_t moe_route_pending_bytes = 0;
+    uint64_t moe_route_next_report = 4096;
+    llama_moe_route_stats moe_route_stats;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -348,6 +442,9 @@ private:
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+
+    std::set<int32_t> hidden_state_layers;
+    std::map<int32_t, std::vector<float>> hidden_states;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

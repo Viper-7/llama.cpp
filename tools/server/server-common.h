@@ -40,6 +40,24 @@ using json = common_json;
 
 using raw_buffer = std::vector<uint8_t>;
 
+struct visiontower_encode_result {
+    uint32_t n_tokens = 0;
+    llama_pos n_pos = 0;
+    int32_t n_pos_per_embd = 0;
+    size_t n_embd = 0;
+    bool use_non_causal = false;
+    std::vector<float> embd;
+    std::vector<llama_pos> pos;
+    std::string sha256;
+};
+
+// Calls an external vision encoder and validates its embedding/position
+// response contract. Exposed for hermetic server contract tests.
+visiontower_encode_result visiontower_encode(
+        const std::string & base_url,
+        bool is_video,
+        const raw_buffer & bytes);
+
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value
@@ -157,6 +175,11 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
  * it is made this way to simplify the logic of KV cache management.
  */
 struct server_tokens {
+    struct page_boundary {
+        size_t token_count = 0;
+        llama_pos position = 0;
+    };
+
     bool has_mtmd = false;
 
 private: // disallow accessing these members directly, risking out-of-sync
@@ -164,6 +187,11 @@ private: // disallow accessing these members directly, risking out-of-sync
     // map a **start** index in tokens to the image chunk
     // note: the order need to be in-sync with tokens
     std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
+
+    // Stable digest of each complete media chunk, including encoded embeddings
+    // and position data. Kept separately because processed prompts retain only
+    // placeholder chunks once their values are resident in model state.
+    std::map<size_t, std::string> map_idx_to_media_identity;
 
     // list of tokens
     //   if the token is LLAMA_TOKEN_NULL, it indicates that this position is occupied by media chunk
@@ -209,6 +237,21 @@ public:
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
+    bool has_stable_media_identity() const;
+
+    // Deterministic complete-chunk boundaries whose model-position span is at
+    // least page_positions. Media chunks are never split across pages.
+    std::vector<page_boundary> page_boundaries(size_t page_positions) const;
+
+    // True only at a complete text/media boundary, never inside an embedding chunk.
+    bool complete_boundary(size_t count) const;
+
+    // Hash the exact causal prefix, including media embedding/position identity.
+    // count must end at a complete text/media boundary.
+    std::string cache_prefix_hash(size_t count) const;
+
     // find next media chunk after idx
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
@@ -231,6 +274,9 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
+    // Direct text-token view for callers that have already excluded media.
+    const llama_tokens & get_text_tokens_view() const;
+
     llama_tokens get_text_tokens() const;
 
     std::vector<char> serialize() const;
@@ -245,6 +291,7 @@ public:
 
     void clear() {
         map_idx_to_media.clear();
+        map_idx_to_media_identity.clear();
         tokens.clear();
     }
 

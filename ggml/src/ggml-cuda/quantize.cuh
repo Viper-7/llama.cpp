@@ -21,6 +21,15 @@ void quantize_row_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// Exact-shape GLM routed-expert helper. It quantizes the normal Q8_1 input and,
+// in one designated workgroup, sorts the small (token, rank) assignment list.
+// The following MMVQ launch consumes sorted_assignments after this stream launch
+// has completed; no device-wide synchronization is needed inside the kernel.
+void quantize_row_q8_1_iq4_xs_sorted_moe_cuda(
+        const float * x, const int32_t * ids, void * vy, uint8_t * sorted_assignments, uint32_t ids_stride,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,

@@ -189,10 +189,6 @@ class NemotronNanoV2VLModel(MmprojModel):
         if "input_conditioner" in name:
             return None
 
-        # mtmd does not support video yet so skip tensors related to video.
-        if "radio_model.model.patch_generator.video_embedder" in name:
-            return None
-
         if not name.startswith(("vision_model.radio_model.model.", "mlp1.", "sound_encoder.", "sound_projection.")):
             return None
 
@@ -207,6 +203,14 @@ class NemotronNanoV2VLModel(MmprojModel):
         return name, gen
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if "radio_model.model.patch_generator.video_embedder" in name:
+            patch_size = self.hparams["patch_size"]
+            n_embd = self.hparams["hidden_size"]
+            temporal_patch_size = self.global_config.get("video_temporal_patch_size", 2)
+            data_torch = data_torch.reshape(n_embd, temporal_patch_size * 3, patch_size, patch_size)
+            yield "v.video_patch_embd.weight", data_torch
+            return
+
         # RADIO's pos_embed doesn't have .weight suffix, but clip.cpp expects it
         if "patch_generator.pos_embed" in name:
             # Downsample position embeddings for fixed 512x512 image size

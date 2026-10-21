@@ -91,6 +91,23 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Export only memory cells in [p0, p1). Restore the blob with llama_state_seq_set_data_ext.
+// Hybrid memories may require p1 to be the current sequence tail.
+LLAMA_API size_t llama_state_seq_get_size_range_ext(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+                    llama_pos   p0,
+                    llama_pos   p1,
+       llama_state_seq_flags   flags);
+
+LLAMA_API size_t llama_state_seq_get_data_range_ext(
+        struct llama_context * ctx,
+                     uint8_t * dst,
+                      size_t   size,
+                llama_seq_id   seq_id,
+                    llama_pos   p0,
+                    llama_pos   p1,
+       llama_state_seq_flags   flags);
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
@@ -131,6 +148,31 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// Override rows of the next native-MTP hidden-state input with device-resident
+// rows from the most recent NextN output of src. The host batch embedding stays
+// as a correctness fallback. Returns false when the requested source rows are
+// not resident in the current graph result.
+LLAMA_API bool llama_set_nextn_input_from(
+        struct llama_context * dst,
+        struct llama_context * src,
+                       int32_t src_row,
+                       int32_t dst_row,
+                       int32_t n_rows);
+
+// Keep emitting the NextN graph output but optionally suppress its automatic
+// device-to-host extraction. Enabled by default.
+LLAMA_API void llama_set_embeddings_nextn_host(struct llama_context * ctx, bool enabled);
+
+// Snapshot one current NextN output row into an owned backend-local carry
+// tensor. The carry survives graph rebuilds and can seed the next MTP decode.
+LLAMA_API bool llama_preserve_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// Explicit synchronous fallbacks for callers that cannot use a resident row.
+LLAMA_API bool llama_copy_embeddings_nextn_ith(
+        struct llama_context * ctx, int32_t i, float * dst, size_t n_floats);
+LLAMA_API bool llama_copy_embeddings_nextn_carry(
+        struct llama_context * ctx, float * dst, size_t n_floats);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);

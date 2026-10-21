@@ -216,6 +216,8 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        ggml_backend_event_t (*event_new_timing)  (ggml_backend_dev_t dev);
+        bool                 (*event_elapsed_time)(ggml_backend_dev_t dev, ggml_backend_event_t start, ggml_backend_event_t end, float * elapsed_ms);
     };
 
     struct ggml_backend_device {

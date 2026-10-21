@@ -11,6 +11,329 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
+#include <fstream>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+
+struct shared_prompt_cache_file {
+    std::string path;
+    size_t size = 0;
+    int64_t mtime = 0;
+};
+
+constexpr uint64_t SHARED_PROMPT_CACHE_MAGIC = 0x535043474d344b56ull; // "SPCGM4KV"
+constexpr uint32_t SHARED_PROMPT_CACHE_VERSION = 2;
+
+std::string getenv_str(const char * name) {
+    const char * value = std::getenv(name);
+    return value == nullptr ? std::string() : std::string(value);
+}
+
+size_t getenv_mib(const char * name, size_t default_mib) {
+    const std::string value = getenv_str(name);
+    if (value.empty()) {
+        return default_mib;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str() || parsed == 0) {
+        return default_mib;
+    }
+    return size_t(parsed) * 1024ull * 1024ull;
+}
+
+bool mkdir_p(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    std::string cur;
+    cur.reserve(path.size());
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur.push_back(path[i]);
+        if (path[i] != '/' || cur.size() == 1) {
+            continue;
+        }
+        if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) {
+            return false;
+        }
+    }
+
+    return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+}
+
+class scoped_flock {
+public:
+    explicit scoped_flock(const std::string & path) {
+        fd = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+        if (fd >= 0 && flock(fd, LOCK_EX) != 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+
+    ~scoped_flock() {
+        if (fd >= 0) {
+            flock(fd, LOCK_UN);
+            close(fd);
+        }
+    }
+
+    bool ok() const {
+        return fd >= 0;
+    }
+
+private:
+    int fd = -1;
+};
+
+uint64_t fnv1a_tokens(const llama_tokens & tokens) {
+    uint64_t h = 1469598103934665603ull;
+    for (const llama_token token : tokens) {
+        uint32_t v = uint32_t(token);
+        for (int i = 0; i < 4; ++i) {
+            h ^= uint8_t(v & 0xffu);
+            h *= 1099511628211ull;
+            v >>= 8;
+        }
+    }
+    return h;
+}
+
+template <typename T>
+bool read_pod(std::istream & in, T & value) {
+    in.read(reinterpret_cast<char *>(&value), sizeof(T));
+    return bool(in);
+}
+
+template <typename T>
+bool write_pod(std::ostream & out, const T & value) {
+    out.write(reinterpret_cast<const char *>(&value), sizeof(T));
+    return bool(out);
+}
+
+bool read_bytes(std::istream & in, std::vector<uint8_t> & data, size_t size) {
+    data.resize(size);
+    if (size == 0) {
+        return true;
+    }
+    in.read(reinterpret_cast<char *>(data.data()), size);
+    return bool(in);
+}
+
+bool write_bytes(std::ostream & out, const std::vector<uint8_t> & data) {
+    if (!data.empty()) {
+        out.write(reinterpret_cast<const char *>(data.data()), data.size());
+    }
+    return bool(out);
+}
+
+std::vector<shared_prompt_cache_file> list_shared_prompt_files(const std::string & dir) {
+    std::vector<shared_prompt_cache_file> files;
+    DIR * dp = opendir(dir.c_str());
+    if (dp == nullptr) {
+        return files;
+    }
+
+    while (dirent * ent = readdir(dp)) {
+        const std::string name = ent->d_name;
+        if (name.size() < 6 || name.substr(name.size() - 5) != ".g4pc") {
+            continue;
+        }
+
+        const std::string path = dir + "/" + name;
+        struct stat st {};
+        if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        files.push_back(shared_prompt_cache_file{
+            path,
+            size_t(st.st_size),
+            int64_t(st.st_mtime),
+        });
+    }
+
+    closedir(dp);
+    return files;
+}
+
+void evict_shared_prompt_files(const std::string & dir, size_t limit_size) {
+    if (limit_size == 0) {
+        return;
+    }
+
+    auto files = list_shared_prompt_files(dir);
+    size_t total = 0;
+    for (const auto & file : files) {
+        total += file.size;
+    }
+
+    std::sort(files.begin(), files.end(), [](const auto & a, const auto & b) {
+        if (a.mtime != b.mtime) {
+            return a.mtime < b.mtime;
+        }
+        return a.path < b.path;
+    });
+
+    for (const auto & file : files) {
+        if (total <= limit_size || files.size() <= 1) {
+            break;
+        }
+        if (std::remove(file.path.c_str()) == 0) {
+            SRV_WRN(" - shared prompt cache evicted %s (size = %.3f MiB)\n",
+                    file.path.c_str(), file.size / (1024.0 * 1024.0));
+            total -= file.size;
+        }
+    }
+}
+
+std::string shared_prompt_cache_dir() {
+    return getenv_str("LLAMA_ARG_SHARED_PROMPT_CACHE_DIR");
+}
+
+size_t shared_prompt_cache_limit_size() {
+    return getenv_mib("LLAMA_ARG_SHARED_PROMPT_CACHE_MIB", 65536);
+}
+
+bool shared_prompt_cache_enabled() {
+    return !shared_prompt_cache_dir().empty();
+}
+
+bool server_tokens_text_only(const server_tokens & tokens) {
+    return !tokens.has_media();
+}
+
+llama_tokens shared_prompt_raw_tokens(const server_tokens & tokens) {
+    llama_tokens raw_tokens;
+    raw_tokens.reserve(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        raw_tokens.emplace_back(tokens[i]);
+    }
+    return raw_tokens;
+}
+
+bool read_shared_prompt_header(
+        const std::string & path,
+        server_tokens & tokens,
+        uint64_t & state_size,
+        uint32_t & n_checkpoints) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    uint64_t created_us = 0;
+    uint64_t n_tokens = 0;
+    uint64_t state_size_drft = 0;
+    if (!read_pod(in, magic) || !read_pod(in, version) || !read_pod(in, created_us) ||
+        !read_pod(in, n_tokens) || !read_pod(in, state_size) || !read_pod(in, state_size_drft)) {
+        return false;
+    }
+    if (magic != SHARED_PROMPT_CACHE_MAGIC || version != SHARED_PROMPT_CACHE_VERSION) {
+        return false;
+    }
+    if (n_tokens > 1024ull * 1024ull) {
+        return false;
+    }
+    state_size += state_size_drft;
+    n_checkpoints = 0;
+
+    llama_tokens raw_tokens;
+    raw_tokens.resize(size_t(n_tokens));
+    if (!raw_tokens.empty()) {
+        in.read(reinterpret_cast<char *>(raw_tokens.data()), raw_tokens.size() * sizeof(llama_token));
+        if (!in) {
+            return false;
+        }
+    }
+    tokens = server_tokens(raw_tokens, false);
+    return true;
+}
+
+bool read_shared_prompt_file(const std::string & path, server_prompt_cache_state & state) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    uint64_t created_us = 0;
+    uint64_t n_tokens = 0;
+    uint64_t state_size_main = 0;
+    uint64_t state_size_drft = 0;
+    if (!read_pod(in, magic) || !read_pod(in, version) || !read_pod(in, created_us) ||
+        !read_pod(in, n_tokens) || !read_pod(in, state_size_main) || !read_pod(in, state_size_drft)) {
+        return false;
+    }
+    if (magic != SHARED_PROMPT_CACHE_MAGIC || version != SHARED_PROMPT_CACHE_VERSION) {
+        return false;
+    }
+
+    llama_tokens raw_tokens;
+    raw_tokens.resize(size_t(n_tokens));
+    if (!raw_tokens.empty()) {
+        in.read(reinterpret_cast<char *>(raw_tokens.data()), raw_tokens.size() * sizeof(llama_token));
+        if (!in) {
+            return false;
+        }
+    }
+
+    state.prompt.tokens = server_tokens(raw_tokens, false);
+    state.prompt.checkpoints.clear();
+    if (!read_bytes(in, state.data.main, size_t(state_size_main)) ||
+        !read_bytes(in, state.data.drft, size_t(state_size_drft))) {
+        return false;
+    }
+
+    return true;
+}
+
+bool write_shared_prompt_file(const std::string & path, const server_prompt_cache_state & state) {
+    const llama_tokens raw_tokens = shared_prompt_raw_tokens(state.prompt.tokens);
+    const uint64_t created_us = uint64_t(ggml_time_us());
+    const uint64_t n_tokens = uint64_t(raw_tokens.size());
+    const uint64_t state_size_main = uint64_t(state.data.main.size());
+    const uint64_t state_size_drft = uint64_t(state.data.drft.size());
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+
+    if (!write_pod(out, SHARED_PROMPT_CACHE_MAGIC) ||
+        !write_pod(out, SHARED_PROMPT_CACHE_VERSION) ||
+        !write_pod(out, created_us) ||
+        !write_pod(out, n_tokens) ||
+        !write_pod(out, state_size_main) ||
+        !write_pod(out, state_size_drft)) {
+        return false;
+    }
+
+    if (!raw_tokens.empty()) {
+        out.write(reinterpret_cast<const char *>(raw_tokens.data()), raw_tokens.size() * sizeof(llama_token));
+        if (!out) {
+            return false;
+        }
+    }
+
+    return write_bytes(out, state.data.main) && write_bytes(out, state.data.drft);
+}
+
+} // namespace
 
 //
 // task_params
@@ -576,7 +899,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         {"model",        oaicompat_model},
         {"object",       "response"},
         {"output",       output},
-        {"status",       "completed"},
+        {"status",       stop == STOP_TYPE_LIMIT ? "incomplete" : "completed"},
         {"usage",        json {
             {"input_tokens",  n_prompt_tokens},
             {"output_tokens", n_decoded},
@@ -585,6 +908,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         }},
     };
 
+    if (stop == STOP_TYPE_LIMIT) res["incomplete_details"] = {{"reason", "max_output_tokens"}};
     return res;
 }
 
@@ -689,14 +1013,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     std::time_t t = std::time(0);
     server_sent_events.push_back(json {
-        {"event", "response.completed"},
+        {"event", stop == STOP_TYPE_LIMIT ? "response.incomplete" : "response.completed"},
         {"data", json {
-            {"type", "response.completed"},
+            {"type", stop == STOP_TYPE_LIMIT ? "response.incomplete" : "response.completed"},
             {"response", json {
                 {"id",         oai_resp_id},
                 {"object",     "response"},
                 {"created_at", t},
-                {"status",     "completed"},
+                {"status",     stop == STOP_TYPE_LIMIT ? "incomplete" : "completed"},
                 {"model",      oaicompat_model},
                 {"output",     output},
                 {"usage",      json {
@@ -709,6 +1033,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         }}
     });
 
+    if (stop == STOP_TYPE_LIMIT) {
+        server_sent_events.back().at("data").at("response")["incomplete_details"] = {{"reason", "max_output_tokens"}};
+    }
     if (stats.is_set()) {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
     }
@@ -1169,6 +1496,19 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     std::vector<json> events;
 
+    if (!is_progress && !is_begin && !tokens.empty() && tokens.front() != LLAMA_TOKEN_NULL) {
+        events.push_back({{"event", "serverless.tokens"}, {"data", {
+            {"type", "serverless.tokens"}, {"token_ids", tokens},
+            {"offset", n_decoded - int(tokens.size())}, {"input_tokens", n_prompt_tokens}
+        }}});
+    }
+    if (is_progress) {
+        events.push_back({{"event", "serverless.progress"}, {"data", {
+            {"type", "serverless.progress"}, {"phase", "prefill"},
+            {"prompt_progress", progress.to_json()}
+        }}});
+    }
+
     if (!oai_resp_created) {
         events.push_back(json {
             {"event", "response.created"},
@@ -1495,6 +1835,27 @@ json server_task_result_embd::to_json_oaicompat() {
         {"embedding",        embedding[0]},
         {"tokens_evaluated", n_tokens},
     };
+}
+
+//
+// server_task_result_hidden_state
+//
+json server_task_result_hidden_state::to_json() {
+    json res {
+        {"index",           index},
+        {"layers",          layers},
+        {"token_count",     n_tokens},
+        {"n_embd",          n_embd},
+        {"hidden_states",   hidden_states},
+        {"pooling",         pooling},
+        {"encoding_format", encoding_format},
+    };
+
+    if (include_tokens) {
+        res["tokens"] = tokens;
+    }
+
+    return res;
 }
 
 //
@@ -1834,6 +2195,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best = states.end();
+    bool loaded_local = false;
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1897,9 +2259,181 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+        loaded_local = true;
+    }
+
+    if (!loaded_local && load_shared(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot)) {
+        return true;
     }
 
     return true;
+}
+
+bool server_shared_prompt_cache_enabled() {
+    return shared_prompt_cache_enabled();
+}
+
+void server_shared_prompt_cache_save(const server_prompt_cache_state & state) {
+    if (!shared_prompt_cache_enabled()) {
+        return;
+    }
+    if (!server_tokens_text_only(state.prompt.tokens)) {
+        SRV_WRN("%s", " - shared prompt cache skipped mtmd/media prompt\n");
+        return;
+    }
+    if (state.data.main.empty() || state.prompt.tokens.empty()) {
+        return;
+    }
+
+    const std::string dir = shared_prompt_cache_dir();
+    if (!mkdir_p(dir)) {
+        SRV_WRN(" - shared prompt cache disabled, cannot create %s: %s\n", dir.c_str(), std::strerror(errno));
+        return;
+    }
+
+    scoped_flock lock(dir + "/.lock");
+    if (!lock.ok()) {
+        SRV_WRN(" - shared prompt cache lock failed for %s: %s\n", dir.c_str(), std::strerror(errno));
+        return;
+    }
+
+    const llama_tokens raw_tokens = shared_prompt_raw_tokens(state.prompt.tokens);
+    const uint64_t hash = fnv1a_tokens(raw_tokens);
+    const uint64_t now = uint64_t(ggml_time_us());
+    const std::string base = string_format("%016" PRIx64 "-%zu-%" PRIu64 "-%d.g4pc",
+                                           hash, raw_tokens.size(), now, int(getpid()));
+    const std::string tmp_path = dir + "/." + base + ".tmp";
+    const std::string final_path = dir + "/" + base;
+
+    const int64_t t_start = ggml_time_us();
+    if (!write_shared_prompt_file(tmp_path, state)) {
+        SRV_WRN(" - shared prompt cache write failed for %s\n", tmp_path.c_str());
+        std::remove(tmp_path.c_str());
+        return;
+    }
+    if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+        SRV_WRN(" - shared prompt cache rename failed for %s: %s\n", final_path.c_str(), std::strerror(errno));
+        std::remove(tmp_path.c_str());
+        return;
+    }
+
+    SRV_WRN(" - shared prompt cache saved %s: %d tokens, checkpoints: %zu, %.3f MiB, took %.2f ms\n",
+            final_path.c_str(), state.prompt.n_tokens(), state.prompt.checkpoints.size(),
+            state.size() / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+
+    evict_shared_prompt_files(dir, shared_prompt_cache_limit_size());
+}
+
+bool server_shared_prompt_cache_load(
+    server_prompt & prompt,
+    const server_tokens & tokens_new,
+    llama_context * ctx_tgt,
+    llama_context * ctx_dft,
+    int32_t id_slot,
+    bool * failed_restore) {
+    if (failed_restore != nullptr) {
+        *failed_restore = false;
+    }
+    if (!shared_prompt_cache_enabled()) {
+        return false;
+    }
+    if (!server_tokens_text_only(tokens_new)) {
+        return false;
+    }
+
+    const std::string dir = shared_prompt_cache_dir();
+    scoped_flock lock(dir + "/.lock");
+    if (!lock.ok()) {
+        SRV_WRN(" - shared prompt cache lock failed for %s: %s\n", dir.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
+    float sim_best    = float(lcp_base) / tokens_new.size();
+    std::string best_path;
+    server_tokens best_tokens;
+    uint64_t best_state_size = 0;
+    uint32_t best_n_checkpoints = 0;
+
+    for (const auto & file : list_shared_prompt_files(dir)) {
+        server_tokens cur_tokens;
+        uint64_t state_size = 0;
+        uint32_t n_checkpoints = 0;
+        if (!read_shared_prompt_header(file.path, cur_tokens, state_size, n_checkpoints)) {
+            continue;
+        }
+        if (cur_tokens.empty()) {
+            continue;
+        }
+
+        const int lcp_cur = cur_tokens.get_common_prefix(tokens_new);
+        const float f_keep_cur = float(lcp_cur) / cur_tokens.size();
+        const float sim_cur    = float(lcp_cur) / tokens_new.size();
+
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+
+        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+            f_keep_best = f_keep_cur;
+            sim_best    = sim_cur;
+            best_path   = file.path;
+            best_tokens = std::move(cur_tokens);
+            best_state_size = state_size;
+            best_n_checkpoints = n_checkpoints;
+        }
+    }
+
+    if (best_path.empty()) {
+        return false;
+    }
+
+    server_prompt_cache_state loaded;
+    const int64_t t_start = ggml_time_us();
+    if (!read_shared_prompt_file(best_path, loaded)) {
+        SRV_WRN(" - shared prompt cache failed to read %s\n", best_path.c_str());
+        return false;
+    }
+
+    const size_t size_main = loaded.data.main.size();
+    const size_t n_main = llama_state_seq_set_data_ext(ctx_tgt, loaded.data.main.data(), size_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t size_drft = loaded.data.drft.size();
+    const size_t n_drft = size_drft > 0 && ctx_dft
+        ? llama_state_seq_set_data_ext(ctx_dft, loaded.data.drft.data(), size_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE)
+        : size_drft;
+    if (n_main != size_main || n_drft != size_drft || (size_drft > 0 && !ctx_dft)) {
+        SRV_WRN(" - shared prompt cache failed to restore %s (target %zu/%zu, draft %zu/%zu)\n",
+                best_path.c_str(), n_main, size_main, n_drft, size_drft);
+        if (failed_restore != nullptr) {
+            *failed_restore = true;
+        }
+        if (std::remove(best_path.c_str()) == 0) {
+            SRV_WRN(" - shared prompt cache removed failed restore candidate %s\n", best_path.c_str());
+        } else {
+            SRV_WRN(" - shared prompt cache failed to remove restore candidate %s: %s\n",
+                    best_path.c_str(), std::strerror(errno));
+        }
+        return false;
+    }
+
+    loaded.data.main.clear();
+    loaded.data.drft.clear();
+    prompt = std::move(loaded.prompt);
+
+    SRV_WRN(" - shared prompt cache restored %s: f_keep = %.3f, sim = %.3f, state = %.3f MiB, checkpoints = %u, took %.2f ms\n",
+            best_path.c_str(), f_keep_best, sim_best, best_state_size / (1024.0 * 1024.0),
+            best_n_checkpoints, (ggml_time_us() - t_start) / 1000.0);
+
+    return true;
+}
+
+void server_prompt_cache::save_shared(const server_prompt_cache_state & state) const {
+    server_shared_prompt_cache_save(state);
+}
+
+bool server_prompt_cache::load_shared(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const {
+    return server_shared_prompt_cache_load(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot);
 }
 
 void server_prompt_cache::update() {

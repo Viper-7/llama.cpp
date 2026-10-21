@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "turbo3.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -217,6 +218,125 @@ static void set_rows_cuda(
     }
 }
 
+template <typename idx_t>
+__launch_bounds__(QK_TURBO3)
+static __global__ void k_set_rows_turbo3(
+        const float * __restrict__ src, const idx_t * __restrict__ rows, block_turbo3_0 * __restrict__ dst,
+        int64_t groups_per_row, int64_t ne01, int64_t ne02, int64_t ne11, int64_t ne12,
+        int64_t s01, int64_t s02, int64_t s03, int64_t s10, int64_t s11, int64_t s12,
+        int64_t nb1, int64_t nb2, int64_t nb3) {
+    const int i = threadIdx.x;
+    const int64_t group = blockIdx.x;
+    const int64_t i_group = group % groups_per_row;
+    int64_t tmp = group/groups_per_row;
+    const int64_t i01 = tmp % ne01;
+    tmp /= ne01;
+    const int64_t i02 = tmp % ne02;
+    const int64_t i03 = tmp/ne02;
+    const int64_t dst_row = rows[i01*s10 + (i02 % ne11)*s11 + (i03 % ne12)*s12];
+
+    const float * src_row = src + i01*s01 + i02*s02 + i03*s03;
+    block_turbo3_0 * dst_row_ptr = (block_turbo3_0 *) ((char *) dst + dst_row*nb1 + i02*nb2 + i03*nb3);
+    block_turbo3_0 * block = dst_row_ptr + i_group;
+
+    __shared__ float values[QK_TURBO3];
+    __shared__ float partial[QK_TURBO3/WARP_SIZE];
+    __shared__ float source_norm_sq;
+    __shared__ float recon_norm_sq;
+
+    values[i] = src_row[i_group*QK_TURBO3 + i];
+    __syncthreads();
+
+    float reduce = values[i]*values[i];
+    for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+        reduce += __shfl_xor_sync(0xffffffff, reduce, offset, WARP_SIZE);
+    }
+    if (i % WARP_SIZE == 0) {
+        partial[i/WARP_SIZE] = reduce;
+    }
+    __syncthreads();
+    if (i == 0) {
+        source_norm_sq = partial[0] + partial[1] + partial[2] + partial[3];
+    }
+    __syncthreads();
+
+    // Match the CPU path's `sqrt(norm_sq) > 1e-10` predicate exactly.
+    values[i] *= source_norm_sq > 1e-20f ? rsqrtf(source_norm_sq) : 0.0f;
+    values[i] *= TURBO3_WHT_SIGNS1[i];
+    __syncthreads();
+#define TURBO3_SET_ROWS_WHT_STAGE(width) \
+    if (i % (2*(width)) < (width)) { \
+        const float a = values[i]; const float b = values[i + (width)]; \
+        values[i] = a + b; values[i + (width)] = a - b; \
+    } \
+    __syncthreads();
+    TURBO3_SET_ROWS_WHT_STAGE(1)
+    TURBO3_SET_ROWS_WHT_STAGE(2)
+    TURBO3_SET_ROWS_WHT_STAGE(4)
+    TURBO3_SET_ROWS_WHT_STAGE(8)
+    TURBO3_SET_ROWS_WHT_STAGE(16)
+    TURBO3_SET_ROWS_WHT_STAGE(32)
+    TURBO3_SET_ROWS_WHT_STAGE(64)
+#undef TURBO3_SET_ROWS_WHT_STAGE
+
+    const uint8_t code = turbo3_nearest_centroid(values[i]*0.08838834764831845f*TURBO3_WHT_SIGNS2[i]);
+    const int lane = i % WARP_SIZE;
+    uint8_t packed_low = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        packed_low |= __shfl_sync(0xffffffff, code & 0x3, (lane & ~3) + j, WARP_SIZE) << (2*j);
+    }
+    if (lane % 4 == 0) {
+        block->qs[i/4] = packed_low;
+    }
+
+    // __ballot() is a physical Wave64 ballot on gfx906.  Extract this
+    // logical 32-lane subgroup before packing Turbo3's one-bit plane.
+#if defined(GGML_USE_HIP)
+    const uint64_t physical_ballot = __ballot((code >> 2) & 1);
+    const int half_wave = warpSize > WARP_SIZE ? (i % warpSize)/WARP_SIZE : 0;
+    const uint32_t ballot = (uint32_t) (physical_ballot >> (half_wave*WARP_SIZE));
+#else
+    const uint32_t ballot = __ballot_sync(0xffffffff, (code >> 2) & 1);
+#endif
+    if (lane % 8 == 0) {
+        block->signs[i/8] = (uint8_t) ((ballot >> ((lane/8)*8)) & 0xff);
+    }
+
+    reduce = TURBO3_CENTROIDS[code]*TURBO3_CENTROIDS[code];
+    for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+        reduce += __shfl_xor_sync(0xffffffff, reduce, offset, WARP_SIZE);
+    }
+    if (i % WARP_SIZE == 0) {
+        partial[i/WARP_SIZE] = reduce;
+    }
+    __syncthreads();
+    if (i == 0) {
+        recon_norm_sq = partial[0] + partial[1] + partial[2] + partial[3];
+        // Match the CPU reference's `sqrt(reconstructed_norm_sq) > 1e-10`.
+        block->norm = __float2half(recon_norm_sq > 1e-20f ? sqrtf(source_norm_sq/recon_norm_sq) : sqrtf(source_norm_sq));
+    }
+}
+
+template <typename idx_t>
+static void set_rows_cuda_turbo3(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_TURBO3_0);
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ne00 % QK_TURBO3 == 0);
+
+    const int64_t groups_per_row = ne00/QK_TURBO3;
+    const int64_t group_count = groups_per_row*ne01*ne02*ne03;
+    if (group_count == 0) {
+        return;
+    }
+    k_set_rows_turbo3<idx_t><<<group_count, QK_TURBO3, 0, ctx.stream()>>>(
+        (const float *) src0->data, (const idx_t *) src1->data, (block_turbo3_0 *) dst->data,
+        groups_per_row, ne01, ne02, ne11, ne12,
+        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
+        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t), nb1, nb2, nb3);
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -227,7 +347,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     cudaStream_t stream = ctx.stream();
 
 
-    if (dst->type == GGML_TYPE_F32) {
+    if (dst->type == GGML_TYPE_TURBO3_0) {
+        set_rows_cuda_turbo3<idx_t>(ctx, src0, src1, dst);
+    } else if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(
             src0_d, src1_d, (float*)dst->data,
             ne00, ne01, ne02, ne03,

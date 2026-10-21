@@ -98,6 +98,7 @@ struct clip_graph {
     // build the input after conv2d (inp_raw --> patches)
     // returns tensor with shape [n_embd, n_patches]
     ggml_tensor * build_inp();
+    ggml_tensor * build_video_inp();
 
     ggml_tensor * build_inp_raw(int channels = 3);
 

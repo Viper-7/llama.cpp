@@ -145,6 +145,10 @@ struct server_routes {
     server_http_context::handler_t post_chat_completions_tok;
     server_http_context::handler_t post_control;
     server_http_context::handler_t post_responses_oai;
+    server_http_context::handler_t get_responses_capabilities;
+    server_http_context::handler_t post_responses_cancel;
+    server_http_context::handler_t post_responses_suspend;
+    server_http_context::handler_t post_responses_context;
     server_http_context::handler_t post_responses_tok_oai;
     server_http_context::handler_t post_transcriptions_oai;
     server_http_context::ws_handler_t ws_realtime;
@@ -156,6 +160,9 @@ struct server_routes {
     server_http_context::handler_t post_detokenize;
     server_http_context::handler_t post_embeddings;
     server_http_context::handler_t post_embeddings_oai;
+    server_http_context::handler_t post_hidden_states;
+    server_http_context::handler_t post_cache_probe;
+    server_http_context::handler_t post_cache_release;
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t post_tts;
     server_http_context::handler_t post_systemone;
@@ -178,6 +185,7 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const server_http_req & req, task_response_type res_type);
+    std::unique_ptr<server_res_generator> handle_hidden_states_impl(const server_http_req & req);
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;

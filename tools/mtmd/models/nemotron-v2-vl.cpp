@@ -7,7 +7,8 @@ ggml_cgraph * clip_graph_nemotron_v2_vl::build() {
     const int n_registers = model.class_embedding->ne[1];
     const int n_pos = n_patches + n_registers;
 
-    ggml_tensor * inp = build_inp();
+    const bool is_video_tubelet = model.video_patch_embeddings != nullptr && n_batch == 2;
+    ggml_tensor * inp = is_video_tubelet ? build_video_inp() : build_inp();
 
     // add position embeddings (pre-downsampled during GGUF conversion for fixed 512x512 input)
     inp = ggml_add(ctx0, inp, model.position_embeddings);

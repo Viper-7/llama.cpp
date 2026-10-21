@@ -151,6 +151,7 @@ enum llm_type {
     LLM_TYPE_288B_A19B, // dots3-note
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
+    LLM_TYPE_313B_A17B, // GLM-5.3-Flash
     LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_397B_A17B, // Qwen3.5
     LLM_TYPE_685B_A37B, // DeepSeek V3.2
@@ -586,6 +587,29 @@ struct llama_layer {
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
 
+    // ZAYA CCA and router tensors
+    struct ggml_tensor * cca_conv_dw    = nullptr;
+    struct ggml_tensor * cca_conv_dw_b  = nullptr;
+    struct ggml_tensor * cca_conv_grp   = nullptr;
+    struct ggml_tensor * cca_conv_grp_b = nullptr;
+    struct ggml_tensor * cca_k_scale    = nullptr;
+    struct ggml_tensor * cca_val_proj1  = nullptr;
+    struct ggml_tensor * cca_val_proj2  = nullptr;
+    struct ggml_tensor * res_scale_hs   = nullptr;
+    struct ggml_tensor * res_scale_hs_b = nullptr;
+    struct ggml_tensor * res_scale_res  = nullptr;
+    struct ggml_tensor * res_scale_res_b = nullptr;
+    struct ggml_tensor * zaya_router_down      = nullptr;
+    struct ggml_tensor * zaya_router_down_b    = nullptr;
+    struct ggml_tensor * zaya_router_norm      = nullptr;
+    struct ggml_tensor * zaya_router_mlp0      = nullptr;
+    struct ggml_tensor * zaya_router_mlp0_b    = nullptr;
+    struct ggml_tensor * zaya_router_mlp2      = nullptr;
+    struct ggml_tensor * zaya_router_mlp2_b    = nullptr;
+    struct ggml_tensor * zaya_router_mlp4      = nullptr;
+    struct ggml_tensor * zaya_router_biases    = nullptr;
+    struct ggml_tensor * zaya_router_eda_scale = nullptr;
+
     // kimi-k3
     struct ggml_tensor * ssm_g           = nullptr; // full-rank KDA gate (replaces ssm_g_a/ssm_g_b)
     struct ggml_tensor * attn_res_score  = nullptr; // fused res_norm*res_proj, pre-attention
@@ -778,6 +802,12 @@ struct llama_model {
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
+    // ZAYA final residual scaling
+    struct ggml_tensor * zaya_res_scale_hs    = nullptr;
+    struct ggml_tensor * zaya_res_scale_hs_b  = nullptr;
+    struct ggml_tensor * zaya_res_scale_res   = nullptr;
+    struct ggml_tensor * zaya_res_scale_res_b = nullptr;
+
     // eagle3 / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;
     struct ggml_tensor * fc_s = nullptr;
@@ -940,9 +970,13 @@ struct llama_model_base : public llama_model {
     virtual ~llama_model_base() = default;
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+    ggml_tensor * create_tensor_as(llama_model_loader & ml, const LLM_TN_IMPL & source_tn, const LLM_TN_IMPL & placement_tn,
+            const std::initializer_list<int64_t> & ne, int flags);
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+    ggml_tensor * create_tensor_as(const LLM_TN_IMPL & source_tn, const LLM_TN_IMPL & placement_tn,
+            const std::initializer_list<int64_t> & ne, int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

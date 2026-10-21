@@ -14,6 +14,7 @@
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
+#include "ggml-cuda/conv1d-grouped.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
@@ -61,9 +62,11 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/zaya-qk-norm.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/turbo3-wht.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -96,6 +99,14 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+
+static bool ggml_cuda_transport_stats_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("GGML_SCHED_TRANSPORT_STATS");
+        return value && atoi(value) != 0;
+    }();
+    return enabled;
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -422,6 +433,33 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;
+    }
+
+    if (ggml_cuda_transport_stats_enabled()) {
+        for (int src = 0; src < info.device_count; ++src) {
+            const int src_physical = info.devices[src].physical_device;
+            for (int dst = 0; dst < info.device_count; ++dst) {
+                if (src == dst) {
+                    continue;
+                }
+                const int dst_physical = info.devices[dst].physical_device;
+                int can_access_peer = src_physical == dst_physical;
+                if (src_physical != dst_physical) {
+                    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, src_physical, dst_physical));
+                }
+#ifdef GGML_USE_HIP
+                GGML_LOG_INFO(
+                        "ggml_hip_peer: src=%d src_physical=%d dst=%d dst_physical=%d can_access=%d "
+                        "cross_device_copy_api=hipMemcpyPeerAsync\n",
+                        src, src_physical, dst, dst_physical, can_access_peer);
+#else
+                GGML_LOG_INFO(
+                        "ggml_cuda_peer: src=%d src_physical=%d dst=%d dst_physical=%d can_access=%d "
+                        "cross_device_copy_api=cudaMemcpyPeerAsync\n",
+                        src, src_physical, dst, dst_physical, can_access_peer);
+#endif
+            }
+        }
     }
 
     // configure logging to stdout
@@ -756,10 +794,79 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+static void ggml_cuda_copy_staging_harvest_timing(
+        ggml_backend_cuda_context & ctx,
+        int                         dst,
+        ggml_cuda_copy_staging_slot & slot) {
+    if (!slot.timing_pending) {
+        return;
+    }
+
+    float d2h_ms = 0.0f;
+    float h2d_ms = 0.0f;
+    ggml_cuda_set_device(ctx.device);
+    CUDA_CHECK(cudaEventElapsedTime(&d2h_ms, slot.d2h_start, slot.d2h_stop));
+    ggml_cuda_set_device(slot.dst_device);
+    CUDA_CHECK(cudaEventElapsedTime(&h2d_ms, slot.h2d_start, slot.h2d_stop));
+
+    ctx.copy_staging_timing_copies[dst]++;
+    ctx.copy_staging_timing_bytes[dst] += slot.timing_bytes;
+    ctx.copy_staging_timing_d2h_us[dst] += 1000.0 * d2h_ms;
+    ctx.copy_staging_timing_h2d_us[dst] += 1000.0 * h2d_ms;
+    slot.timing_pending = false;
+    slot.timing_bytes = 0;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    std::lock_guard<std::mutex> staging_lock(copy_staging_mutex);
+    for (int dst = 0; dst < GGML_CUDA_MAX_DEVICES; ++dst) {
+        for (int i = 0; i < GGML_CUDA_COPY_STAGING_SLOTS; ++i) {
+            ggml_cuda_copy_staging_slot & slot = copy_staging[dst][i];
+            if (slot.used || slot.timing_pending) {
+                ggml_cuda_set_device(slot.dst_device);
+                CUDA_CHECK(cudaEventSynchronize(slot.dst_done));
+            }
+            ggml_cuda_copy_staging_harvest_timing(*this, dst, slot);
+            if (slot.src_ready != nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaEventDestroy(slot.src_ready));
+            }
+            if (slot.dst_done != nullptr) {
+                ggml_cuda_set_device(slot.dst_device);
+                CUDA_CHECK(cudaEventDestroy(slot.dst_done));
+            }
+            if (slot.d2h_start != nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaEventDestroy(slot.d2h_start));
+                CUDA_CHECK(cudaEventDestroy(slot.d2h_stop));
+            }
+            if (slot.h2d_start != nullptr) {
+                ggml_cuda_set_device(slot.dst_device);
+                CUDA_CHECK(cudaEventDestroy(slot.h2d_start));
+                CUDA_CHECK(cudaEventDestroy(slot.h2d_stop));
+            }
+            if (slot.host != nullptr) {
+                CUDA_CHECK(cudaFreeHost(slot.host));
+            }
+        }
+        GGML_ASSERT(copy_staging_reuses[dst] ==
+                copy_staging_completed_reuses[dst] + copy_staging_forced_drains[dst]);
+        if (copy_staging_reuses[dst] != 0) {
+            GGML_LOG_INFO("ggml_hip_copy: pinned staging stats src=%d dst=%d reuses=%" PRIu64
+                    " completed=%" PRIu64 " forced_drains=%" PRIu64 "\n",
+                    device, dst, copy_staging_reuses[dst], copy_staging_completed_reuses[dst],
+                    copy_staging_forced_drains[dst]);
+        }
+        if (copy_staging_timing_copies[dst] != 0) {
+            GGML_LOG_INFO("ggml_hip_copy: pinned staging timing src=%d dst=%d copies=%" PRIu64
+                    " bytes=%" PRIu64 " d2h_us=%.3f h2d_us=%.3f\n",
+                    device, dst, copy_staging_timing_copies[dst], copy_staging_timing_bytes[dst],
+                    copy_staging_timing_d2h_us[dst], copy_staging_timing_h2d_us[dst]);
+        }
+    }
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -1038,6 +1145,7 @@ struct ggml_backend_cuda_comm_context {
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
+    bool                        collective_stats = false;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
@@ -1068,6 +1176,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     }
 
     const size_t n_backends = comm_ctx->backends.size();
+    const int64_t t_submit = comm_ctx->collective_stats ? ggml_time_us() : 0;
 
     for (size_t i = 0; i < n_backends; ++i) {
         GGML_ASSERT(tensors[i] != nullptr);
@@ -1091,6 +1200,10 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
             NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
         }
         NCCL_CHECK(ncclGroupEnd());
+        if (comm_ctx->collective_stats) {
+            GGML_LOG_INFO("ggml_rccl_collective: transport=f32 ranks=%zu elements=%" PRId64 " buffer_bytes_per_rank=%" PRIu64 " buffer_bytes_all_ranks=%" PRIu64 " submit_us=%" PRId64 "\n",
+                    n_backends, ne, (uint64_t) ne*sizeof(float), (uint64_t) ne*sizeof(float)*n_backends, ggml_time_us() - t_submit);
+        }
         return true;
     }
 
@@ -1126,6 +1239,11 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         ggml_cuda_set_device(cuda_ctx->device);
         to_fp32(tmp[i].get(), (float *) tensors[i]->data, ne, cuda_ctx->stream());
         CUDA_CHECK(cudaGetLastError());
+    }
+
+    if (comm_ctx->collective_stats) {
+        GGML_LOG_INFO("ggml_rccl_collective: transport=bf16 ranks=%zu elements=%" PRId64 " buffer_bytes_per_rank=%" PRIu64 " buffer_bytes_all_ranks=%" PRIu64 " submit_us=%" PRId64 "\n",
+                n_backends, ne, (uint64_t) ne*sizeof(nv_bfloat16), (uint64_t) ne*sizeof(nv_bfloat16)*n_backends, ggml_time_us() - t_submit);
     }
 
     return true;
@@ -1277,6 +1395,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     }
 
     auto * ret = new ggml_backend_cuda_comm_context;
+    const char * collective_stats = getenv("GGML_META_COLLECTIVE_STATS");
+    ret->collective_stats = collective_stats && atoi(collective_stats) != 0;
     ret->backends.assign(backends, backends + n_backends);
     ret->dev_ids.reserve(n_backends);
     for (size_t i = 0; i < n_backends; i++) {
@@ -2242,6 +2362,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
             break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_turbo3_wht(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -2483,6 +2606,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
             break;
+        case GGML_OP_CONV_1D_GROUPED:
+            ggml_cuda_op_conv1d_grouped(ctx, dst);
+            break;
+        case GGML_OP_ZAYA_QK_NORM:
+            ggml_cuda_op_zaya_qk_norm(ctx, dst);
+            break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             ggml_cuda_conv_2d_transpose_p0(ctx, dst);
             break;
@@ -2678,7 +2807,132 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+#if defined(GGML_USE_HIP)
+            const char * staging_env = getenv("GGML_HIP_NO_PEER_STAGING");
+            const bool staging_enabled = staging_env != nullptr && atoi(staging_env) != 0;
+            static const bool staging_timing_enabled = [] {
+                const char * value = getenv("GGML_HIP_NO_PEER_STAGING_TIMING");
+                return value != nullptr && atoi(value) != 0;
+            }();
+            size_t staging_max_bytes = 1024*1024;
+            if (const char * value = getenv("GGML_HIP_NO_PEER_STAGING_MAX_BYTES")) {
+                staging_max_bytes = strtoull(value, nullptr, 10);
+            }
+            int can_access_peer = 0;
+            if (staging_enabled && ggml_nbytes(dst) <= staging_max_bytes) {
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, src_physical, dst_physical));
+            }
+            if (staging_enabled && !can_access_peer && ggml_nbytes(dst) <= staging_max_bytes) {
+                std::lock_guard<std::mutex> staging_lock(cuda_ctx_src->copy_staging_mutex);
+                const int dst_device = cuda_ctx_dst->device;
+                int slot_id = -1;
+                int oldest_slot_id = -1;
+                uint64_t oldest_sequence = UINT64_MAX;
+
+                for (int i = 0; i < GGML_CUDA_COPY_STAGING_SLOTS; ++i) {
+                    ggml_cuda_copy_staging_slot & candidate = cuda_ctx_src->copy_staging[dst_device][i];
+                    if (!candidate.used) {
+                        slot_id = i;
+                        break;
+                    }
+                    if (candidate.sequence < oldest_sequence) {
+                        oldest_sequence = candidate.sequence;
+                        oldest_slot_id = i;
+                    }
+
+                    ggml_cuda_set_device(candidate.dst_device);
+                    const cudaError_t status = cudaEventQuery(candidate.dst_done);
+                    if (status == cudaSuccess) {
+                        ggml_cuda_copy_staging_harvest_timing(*cuda_ctx_src, dst_device, candidate);
+                        slot_id = i;
+                        cuda_ctx_src->copy_staging_completed_reuses[dst_device]++;
+                        break;
+                    }
+                    if (status != cudaErrorNotReady) {
+                        CUDA_CHECK(status);
+                    }
+                }
+
+                if (slot_id < 0) {
+                    GGML_ASSERT(oldest_slot_id >= 0);
+                    slot_id = oldest_slot_id;
+                    ggml_cuda_copy_staging_slot & oldest = cuda_ctx_src->copy_staging[dst_device][slot_id];
+                    ggml_cuda_set_device(oldest.dst_device);
+                    CUDA_CHECK(cudaEventSynchronize(oldest.dst_done));
+                    ggml_cuda_copy_staging_harvest_timing(*cuda_ctx_src, dst_device, oldest);
+                    cuda_ctx_src->copy_staging_forced_drains[dst_device]++;
+                }
+
+                ggml_cuda_copy_staging_slot & slot = cuda_ctx_src->copy_staging[dst_device][slot_id];
+                const size_t nbytes = ggml_nbytes(dst);
+                if (slot.used) {
+                    cuda_ctx_src->copy_staging_reuses[dst_device]++;
+                    slot.used = false;
+                }
+
+                if (slot.host == nullptr || slot.capacity < nbytes) {
+                    if (slot.host != nullptr) {
+                        CUDA_CHECK(cudaFreeHost(slot.host));
+                    }
+                    CUDA_CHECK(cudaMallocHost(&slot.host, nbytes));
+                    slot.capacity = nbytes;
+                    if (slot.src_ready == nullptr) {
+                        ggml_cuda_set_device(cuda_ctx_src->device);
+                        CUDA_CHECK(cudaEventCreateWithFlags(
+                                &slot.src_ready, cudaEventDisableTiming | hipEventReleaseToSystem));
+                    }
+                    if (slot.dst_done == nullptr) {
+                        ggml_cuda_set_device(cuda_ctx_dst->device);
+                        CUDA_CHECK(cudaEventCreateWithFlags(
+                                &slot.dst_done, cudaEventDisableTiming | hipEventReleaseToSystem));
+                        slot.dst_device = cuda_ctx_dst->device;
+                    }
+                    GGML_LOG_INFO("ggml_hip_copy: pinned staging src=%d dst=%d slot=%d capacity=%zu max=%zu\n",
+                            src_physical, dst_physical, slot_id, slot.capacity, staging_max_bytes);
+                }
+
+                if (staging_timing_enabled && slot.d2h_start == nullptr) {
+                    // The existing src_ready/dst_done events provide the required system-scope fences.
+                    // Timing events only collect timestamps, so avoid adding another system fence per marker.
+                    ggml_cuda_set_device(cuda_ctx_src->device);
+                    CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_start, hipEventDisableSystemFence));
+                    CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_stop, hipEventDisableSystemFence));
+                    ggml_cuda_set_device(cuda_ctx_dst->device);
+                    CUDA_CHECK(cudaEventCreateWithFlags(&slot.h2d_start, hipEventDisableSystemFence));
+                    CUDA_CHECK(cudaEventCreateWithFlags(&slot.h2d_stop, hipEventDisableSystemFence));
+                }
+
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                if (staging_timing_enabled) {
+                    CUDA_CHECK(cudaEventRecord(slot.d2h_start, cuda_ctx_src->stream()));
+                }
+                CUDA_CHECK(cudaMemcpyAsync(slot.host, src->data, nbytes, cudaMemcpyDeviceToHost, cuda_ctx_src->stream()));
+                if (staging_timing_enabled) {
+                    CUDA_CHECK(cudaEventRecord(slot.d2h_stop, cuda_ctx_src->stream()));
+                }
+                CUDA_CHECK(cudaEventRecord(slot.src_ready, cuda_ctx_src->stream()));
+
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), slot.src_ready, 0));
+                if (staging_timing_enabled) {
+                    CUDA_CHECK(cudaEventRecord(slot.h2d_start, cuda_ctx_dst->stream()));
+                }
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, slot.host, nbytes, cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+                if (staging_timing_enabled) {
+                    CUDA_CHECK(cudaEventRecord(slot.h2d_stop, cuda_ctx_dst->stream()));
+                }
+                CUDA_CHECK(cudaEventRecord(slot.dst_done, cuda_ctx_dst->stream()));
+                slot.used = true;
+                slot.timing_pending = staging_timing_enabled;
+                slot.timing_bytes = staging_timing_enabled ? nbytes : 0;
+                slot.sequence = ++cuda_ctx_src->copy_staging_sequence;
+                return true;
+            } else {
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            }
+#else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+#endif // GGML_USE_HIP
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -2713,6 +2967,18 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static void ggml_cuda_graph_profile(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, int mode, const char * mode_name, const char * reason) {
+    if (!ggml_cuda_transport_stats_enabled() || graph->profile_mode == mode) {
+        return;
+    }
+    graph->profile_mode = mode;
+#ifdef GGML_USE_HIP
+    GGML_LOG_INFO("ggml_hip_graph: device=%d mode=%s reason=%s\n", cuda_ctx->device, mode_name, reason);
+#else
+    GGML_LOG_INFO("ggml_cuda_graph: device=%d mode=%s reason=%s\n", cuda_ctx->device, mode_name, reason);
+#endif
+}
+
 static bool ggml_cuda_graph_debug_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DEBUG");
     return enabled;
@@ -2822,6 +3088,13 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        if (ggml_cuda_transport_stats_enabled()) {
+#ifdef GGML_USE_HIP
+            GGML_LOG_INFO("ggml_hip_graph: device=%d event=exec_update_failed_reinstantiated\n", cuda_ctx->device);
+#else
+            GGML_LOG_INFO("ggml_cuda_graph: device=%d event=exec_update_failed_reinstantiated\n", cuda_ctx->device);
+#endif
+        }
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -4832,6 +5105,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     }
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                    ggml_cuda_graph_profile(cuda_ctx, graph, 3, "capture", "warmup_stable");
+                } else {
+                    ggml_cuda_graph_profile(cuda_ctx, graph, 1, "direct", "warmup_properties_changed");
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -4842,12 +5118,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     if (ggml_cuda_graph_debug_enabled()) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     }
+                    ggml_cuda_graph_profile(cuda_ctx, graph, 2, "direct", "properties_changed");
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    ggml_cuda_graph_profile(cuda_ctx, graph, cuda_graph_update_required ? 3 : 4,
+                            cuda_graph_update_required ? "capture" : "launch_reuse",
+                            cuda_graph_update_required ? "instance_missing" : "stable");
                 }
             }
+        } else {
+            ggml_cuda_graph_profile(cuda_ctx, graph, 5, "direct", "unsupported_mul_mat_id_sync");
         }
+    } else if (graph->disable_due_to_gpu_arch) {
+        ggml_cuda_graph_profile(cuda_ctx, graph, 6, "disabled", "gpu_arch");
+    } else {
+        ggml_cuda_graph_profile(cuda_ctx, graph, 7, "disabled", "environment");
     }
 #endif // USE_CUDA_GRAPH
 
@@ -5693,6 +5979,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
                         return true;
+                    case GGML_TYPE_TURBO3_0:
+                        return op->src[0]->ne[0] % QK_TURBO3 == 0;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
                         // 32-value sub-blocks, the row size does not guarantee
@@ -5710,12 +5998,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               op->type == GGML_TYPE_TURBO3_0) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
                            )
                        ) &&
+                       (op->type != GGML_TYPE_TURBO3_0 || op->ne[0] % QK_TURBO3 == 0) &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             }
         case GGML_OP_SET:
@@ -5939,6 +6229,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_POOL_1D:
         case GGML_OP_POOL_2D:
             return true;
+        case GGML_OP_CONV_1D_GROUPED:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_ZAYA_QK_NORM:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_ACC:
             // TODO: extend support like so:
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
@@ -5989,6 +6297,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_TURBO_WHT:
+            // The first Turbo3 cache mode deliberately excludes the optional
+            // InnerQ scale vector. Do not advertise a scaled graph that the
+            // narrow device kernel cannot execute.
+            {
+                int direction;
+                int group_size;
+                memcpy(&direction, op->op_params, sizeof(direction));
+                memcpy(&group_size, op->op_params + sizeof(direction), sizeof(group_size));
+                return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    op->src[1] == nullptr && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                    (direction == 0 || direction == 1) && group_size == QK_TURBO3 &&
+                    op->src[0]->ne[0] % QK_TURBO3 == 0;
+            }
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -6055,6 +6377,28 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 #endif
 }
 
+static ggml_backend_event_t ggml_backend_cuda_device_event_new_timing(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+    ggml_cuda_set_device(dev_ctx->device);
+
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, 0));
+
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event,
+    };
+}
+
+static bool ggml_backend_cuda_device_event_elapsed_time(
+        ggml_backend_dev_t dev, ggml_backend_event_t start, ggml_backend_event_t end, float * elapsed_ms) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
+    CUDA_CHECK(cudaEventElapsedTime(elapsed_ms, (cudaEvent_t)start->context, (cudaEvent_t)end->context));
+    return true;
+}
+
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
@@ -6083,6 +6427,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .event_new               = */ ggml_backend_cuda_device_event_new,
     /* .event_free              = */ ggml_backend_cuda_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
+    /* .event_new_timing        = */ ggml_backend_cuda_device_event_new_timing,
+    /* .event_elapsed_time      = */ ggml_backend_cuda_device_event_elapsed_time,
 };
 
 // backend reg

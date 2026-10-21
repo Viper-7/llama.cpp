@@ -22,6 +22,7 @@ set(LLAMA_CORE_SOURCES
     llama-impl.cpp
     llama-io.cpp
     llama-kv-cache.cpp
+    llama-kv-cache-kpool.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp
     llama-kv-cache-dsa-iswa.cpp
@@ -37,6 +38,7 @@ set(LLAMA_CORE_SOURCES
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
+    llama-moe-route-stats.cpp
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp

@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -7998,6 +7999,35 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static void test_input_video_data_url_is_preserved_as_video() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/Qwen-Qwen3-0.6B.jinja");
+
+    server_chat_params opt;
+    opt.tmpls = std::move(tmpls);
+    opt.use_jinja = true;
+    opt.allow_video = true;
+    opt.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+
+    json body = {
+        {"messages", json::array({json{
+            {"role", "user"},
+            {"content", json::array({json{
+                {"type", "input_video"},
+                {"input_video", json{{"data", "data:video/mp4;base64,AQID"}}},
+            }})},
+        }})},
+    };
+    std::vector<raw_buffer> out_files;
+    common_chat_session out_session;
+    (void) oaicompat_chat_params_parse(nullptr, body, opt, out_files, out_session);
+    assert_equals((size_t) 1, out_files.size());
+    assert_equals((size_t) 11, out_files[0].size());
+    assert_equals((unsigned char) 1, out_files[0][8]);
+    assert_equals((unsigned char) 2, out_files[0][9]);
+    assert_equals((unsigned char) 3, out_files[0][10]);
+}
+
 static void test_reasoning_effort_caps() {
     LOG_DBG("%s\n", __func__);
 
@@ -8094,7 +8124,29 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_native_response_token_only_partial() {
+    for (int offset = 0; offset < 3; ++offset) {
+        server_task_result_cmpl_partial result;
+        result.tokens = {100 + offset};
+        result.n_decoded = offset + 1;
+        result.n_prompt_tokens = 1000;
+        result.content.text = "";
+        const auto events = result.to_json_oaicompat_resp();
+        GGML_ASSERT(events[0]["data"]["type"] == "serverless.tokens");
+        GGML_ASSERT(events[0]["data"]["offset"] == offset);
+        GGML_ASSERT(events[0]["data"]["token_ids"] == json::array({100 + offset}));
+        for (const auto & event : events) {
+            GGML_ASSERT(event["event"] != "response.output_text.delta");
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--native-token-provenance-only") {
+        test_native_response_token_only_partial();
+        return 0;
+    }
+
     bool detailed_debug    = false;
     bool only_run_filtered = false;
 
@@ -8181,6 +8233,7 @@ int main(int argc, char ** argv) {
         test_chat_session();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_input_video_data_url_is_preserved_as_video();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

@@ -5,6 +5,8 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <exception>
 #include <memory>
 #include <vector>
 
@@ -181,9 +183,9 @@ struct test_context_with_graph {
     ggml_context_ptr ctx_ptr;
 };
 
-static test_context_with_graph make_context() {
+static test_context_with_graph make_context(size_t n_tensors = 48) {
     ggml_init_params params{};
-    params.mem_size = 48 * ggml_tensor_overhead() + ggml_graph_overhead();
+    params.mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
     params.no_alloc = true;
 
     ggml_context *   ctx     = ggml_init(params);
@@ -677,6 +679,117 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void test_scheduler_alias_subviews() {
+#ifdef _WIN32
+    GGML_ASSERT(_putenv_s("GGML_SCHED_ALIAS_SUBVIEWS", "1") == 0);
+#else
+    GGML_ASSERT(setenv("GGML_SCHED_ALIAS_SUBVIEWS", "1", 1) == 0);
+#endif
+
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context(192);
+
+    ggml_tensor * root = make_input_1d(ctx, 64);
+    std::vector<ggml_tensor *> views;
+    std::vector<ggml_tensor *> outputs;
+    for (int i = 0; i < 40; ++i) {
+        ggml_tensor * view = ggml_view_1d(ctx, root, 4, (i + 1) * sizeof(float));
+        ggml_tensor * output = ggml_scale(ctx, view, 2.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        views.push_back(view);
+        outputs.push_back(output);
+    }
+
+    ggml_backend_t backends[2] = { &backend_b.context->backend, &backend_a.context->backend };
+    ggml_backend_buffer_type_t bufts[2] = { &backend_b.buffer_type, &backend_a.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 256, true, true));
+    ggml_backend_sched_set_tensor_backend(sched.get(), root, backends[1]);
+    for (ggml_tensor * output : outputs) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), output, backends[0]);
+    }
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 1);
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        const ggml_tensor * alias = outputs[i]->src[0];
+        GGML_ASSERT(alias != views[i]);
+        GGML_ASSERT(alias->view_src != nullptr && alias->view_src != root);
+        GGML_ASSERT(alias->view_offs == views[i]->view_offs);
+        GGML_ASSERT(alias->data == (char *) alias->view_src->data + alias->view_offs);
+    }
+}
+
+static void test_scheduler_alias_full_copy_parallel() {
+#ifdef _WIN32
+    GGML_ASSERT(_putenv_s("GGML_SCHED_ALIAS_COPIES", "1") == 0);
+    GGML_ASSERT(_putenv_s("GGML_SCHED_ALIAS_SUBVIEWS", "0") == 0);
+#else
+    GGML_ASSERT(setenv("GGML_SCHED_ALIAS_COPIES", "1", 1) == 0);
+    GGML_ASSERT(setenv("GGML_SCHED_ALIAS_SUBVIEWS", "0", 1) == 0);
+#endif
+
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context(32);
+
+    ggml_tensor * input = make_input_1d(ctx, 64);
+    ggml_tensor * base = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * view = ggml_reshape_2d(ctx, base, 16, 4);
+    ggml_tensor * base_output = ggml_scale(ctx, base, 3.0f);
+    ggml_tensor * view_output = ggml_scale(ctx, view, 4.0f);
+    ggml_set_output(base_output);
+    ggml_set_output(view_output);
+    ggml_build_forward_expand(graph, base_output);
+    ggml_build_forward_expand(graph, view_output);
+
+    ggml_backend_t backends[2] = { &backend_b.context->backend, &backend_a.context->backend };
+    ggml_backend_buffer_type_t bufts[2] = { &backend_b.buffer_type, &backend_a.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 64, true, true));
+    ggml_backend_sched_set_tensor_backend(sched.get(), input, backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched.get(), base, backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched.get(), base_output, backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched.get(), view_output, backends[0]);
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    const ggml_tensor * base_copy = base_output->src[0];
+    const ggml_tensor * view_alias = view_output->src[0];
+    GGML_ASSERT(base_copy != base);
+    GGML_ASSERT(view_alias != view);
+    GGML_ASSERT(view_alias->view_src == base_copy);
+    GGML_ASSERT(view_alias->view_offs == 0);
+    GGML_ASSERT(view_alias->data == base_copy->data);
+    GGML_ASSERT(memcmp(view_alias->ne, view->ne, sizeof(view->ne)) == 0);
+    GGML_ASSERT(memcmp(view_alias->nb, view->nb, sizeof(view->nb)) == 0);
+
+    void * copy_0_data = base_copy->data;
+    ggml_backend_sched_reset(sched.get());
+
+    auto [ctx_1, graph_1, ctx_ptr_1] = make_context(32);
+    ggml_tensor * input_1 = make_input_1d(ctx_1, 64);
+    ggml_tensor * base_1 = ggml_scale(ctx_1, input_1, 2.0f);
+    ggml_tensor * view_1 = ggml_reshape_2d(ctx_1, base_1, 16, 4);
+    ggml_tensor * base_output_1 = ggml_scale(ctx_1, base_1, 3.0f);
+    ggml_tensor * view_output_1 = ggml_scale(ctx_1, view_1, 4.0f);
+    ggml_set_output(base_output_1);
+    ggml_set_output(view_output_1);
+    ggml_build_forward_expand(graph_1, base_output_1);
+    ggml_build_forward_expand(graph_1, view_output_1);
+
+    ggml_backend_sched_set_tensor_backend(sched.get(), input_1, backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched.get(), base_1, backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched.get(), base_output_1, backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched.get(), view_output_1, backends[0]);
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph_1));
+    const ggml_tensor * base_copy_1 = base_output_1->src[0];
+    const ggml_tensor * view_alias_1 = view_output_1->src[0];
+    GGML_ASSERT(base_copy_1->data != copy_0_data);
+    GGML_ASSERT(view_alias_1->view_src == base_copy_1);
+    GGML_ASSERT(view_alias_1->data == base_copy_1->data);
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1121,6 +1234,8 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_scheduler_alias_subviews", test_scheduler_alias_subviews);
+    run("test_scheduler_alias_full_copy_parallel", test_scheduler_alias_full_copy_parallel);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);

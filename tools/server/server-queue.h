@@ -51,6 +51,7 @@ public:
 
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
+    bool post_if_awake(server_task && task, bool front = false);
 
     // multi-task version of post()
     int post(std::vector<server_task> && tasks, bool front = false);
@@ -62,7 +63,7 @@ public:
     int get_new_id();
 
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
-    // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
+    // prioritize tasks bound to this slot, then interactive requests (FIFO for ties)
     void pop_deferred_task(int id_slot);
 
     // if sleeping, request exiting sleep state and wait until it is done
@@ -225,6 +226,7 @@ struct server_response_reader {
 
     // if front = true, the task will be posted to the front of the queue (high priority)
     void post_task(server_task && task, bool front = false);
+    bool post_task_if_awake(server_task && task, bool front = false);
     void post_tasks(std::vector<server_task> && tasks, const common_chat_session & session = {}, bool front = false);
     bool has_next() const;
 

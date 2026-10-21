@@ -107,6 +107,33 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl_dual_accumulator(
+        const int * v, const int * u, const T & d8_0, const T & d8_1) {
+    static_assert(vdr == 8, "gfx906 aligned dual accumulator requires eight dot lanes");
+
+    // The Q8_1 tile starts after four ints, has a 36-int row stride, and this
+    // path advances k by eight ints. Its u rows are therefore 16-byte aligned.
+    // Keep the IQ3 tile's deliberately padded 65-int row stride scalar.
+    const int4 u0 = *reinterpret_cast<const int4 *>(u);
+    const int4 u1 = *reinterpret_cast<const int4 *>(u + 4);
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+
+    sumi0 = ggml_cuda_dp4a(v[0], u0.x, sumi0);
+    sumi1 = ggml_cuda_dp4a(v[4], u1.x, sumi1);
+    sumi0 = ggml_cuda_dp4a(v[1], u0.y, sumi0);
+    sumi1 = ggml_cuda_dp4a(v[5], u1.y, sumi1);
+    sumi0 = ggml_cuda_dp4a(v[2], u0.z, sumi0);
+    sumi1 = ggml_cuda_dp4a(v[6], u1.z, sumi1);
+    sumi0 = ggml_cuda_dp4a(v[3], u0.w, sumi0);
+    sumi1 = ggml_cuda_dp4a(v[7], u1.w, sumi1);
+
+    return d8_0*d8_1 * ((T) (sumi0 + sumi1));
+}
+#endif
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -131,9 +158,21 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>
-                    (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K],
-                     x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]);
+                const int * xv = &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0];
+                const int * yv = &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K];
+                const float xd = x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0];
+                const float yd = y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)];
+
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+                if constexpr (type == GGML_TYPE_IQ3_S && J == 8 && !fallback) {
+                    sum[j0/nwarps*I/warp_size + i0/warp_size] +=
+                        vec_dot_q8_0_q8_1_impl_dual_accumulator<float, VDR_Q8_0_Q8_1_MMQ>(xv, yv, xd, yd);
+                } else
+#endif
+                {
+                    sum[j0/nwarps*I/warp_size + i0/warp_size] +=
+                        vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>(xv, yv, xd, yd);
+                }
             }
         }
     }
@@ -1234,4 +1273,3 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 }
-

@@ -6,9 +6,15 @@
 #include "mtmd-helper.h"
 #include "chat.h"
 #include "base64.hpp"
+#include "vendor/hash/hash.h"
 
 #include "server-common.h"
 
+#include <curl/curl.h>
+
+#include <algorithm>
+#include <cctype>
+#include <map>
 #include <filesystem>
 #include <random>
 #include <sstream>
@@ -86,6 +92,58 @@ std::filesystem::path get_server_exec_path() {
     }
     return std::filesystem::path(std::string(path, count));
 #endif
+}
+
+static constexpr unsigned char MTMD_VIDEO_PREFIX[] = {'M', 'T', 'M', 'D', 'V', 'I', 'D', '2'};
+static constexpr unsigned char MTMD_AUDIO_PREFIX[] = {'M', 'T', 'M', 'D', 'A', 'U', 'D', '2'};
+
+static bool is_tagged_video(const raw_buffer & data) {
+    return data.size() >= sizeof(MTMD_VIDEO_PREFIX)
+        && std::equal(std::begin(MTMD_VIDEO_PREFIX), std::end(MTMD_VIDEO_PREFIX), data.begin());
+}
+
+static bool is_tagged_audio(const raw_buffer & data) {
+    return data.size() >= sizeof(MTMD_AUDIO_PREFIX)
+        && std::equal(std::begin(MTMD_AUDIO_PREFIX), std::end(MTMD_AUDIO_PREFIX), data.begin());
+}
+
+static bool looks_like_audio(const raw_buffer & data) {
+    return (data.size() >= 12 && std::memcmp(data.data(), "RIFF", 4) == 0
+            && std::memcmp(data.data() + 8, "WAVE", 4) == 0)
+        || (data.size() >= 4 && std::memcmp(data.data(), "fLaC", 4) == 0)
+        || (data.size() >= 3 && std::memcmp(data.data(), "ID3", 3) == 0)
+        || (data.size() >= 2 && data[0] == 0xff && (data[1] & 0xe0) == 0xe0);
+}
+
+static raw_buffer tag_media(raw_buffer data, bool is_video, bool is_audio = false) {
+    if (!is_video && !is_audio) {
+        return data;
+    }
+    const auto * prefix = is_video ? MTMD_VIDEO_PREFIX : MTMD_AUDIO_PREFIX;
+    raw_buffer tagged;
+    tagged.reserve(sizeof(MTMD_VIDEO_PREFIX) + data.size());
+    tagged.insert(tagged.end(), prefix, prefix + sizeof(MTMD_VIDEO_PREFIX));
+    tagged.insert(tagged.end(), data.begin(), data.end());
+    return tagged;
+}
+
+static std::string media_chunk_identity(const mtmd_input_chunk * chunk) {
+    size_t chunk_size = 0;
+    if (mtmd_input_chunk_save(chunk, nullptr, 0, &chunk_size) != 0 || chunk_size == 0) {
+        throw std::runtime_error("Cannot serialize media chunk identity");
+    }
+    std::vector<char> chunk_data(chunk_size);
+    if (mtmd_input_chunk_save(chunk, chunk_data.data(), chunk_data.size(), nullptr) != 0) {
+        throw std::runtime_error("Cannot serialize media chunk identity");
+    }
+    return hash_sha256_hex(chunk_data.data(), chunk_data.size());
+}
+
+template<typename T>
+static void append_identity_scalar(std::vector<uint8_t> & out, const T & value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    const auto * ptr = reinterpret_cast<const uint8_t *>(&value);
+    out.insert(out.end(), ptr, ptr + sizeof(value));
 }
 
 json format_error_response(const std::string & message, const enum error_type type) {
@@ -606,6 +664,96 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
+bool server_tokens::has_stable_media_identity() const {
+    return map_idx_to_media.size() == map_idx_to_media_identity.size() &&
+        std::all_of(map_idx_to_media.begin(), map_idx_to_media.end(), [&](const auto & item) {
+            const auto found = map_idx_to_media_identity.find(item.first);
+            return found != map_idx_to_media_identity.end() && !found->second.empty();
+        });
+}
+
+std::vector<server_tokens::page_boundary> server_tokens::page_boundaries(size_t page_positions) const {
+    GGML_ASSERT(page_positions > 0);
+    std::vector<page_boundary> result;
+    size_t idx = 0;
+    llama_pos pos = 0;
+    llama_pos next = (llama_pos) page_positions;
+
+    while (idx < tokens.size()) {
+        const auto media_it = map_idx_to_media.find(idx);
+        if (media_it != map_idx_to_media.end()) {
+            pos += mtmd_input_chunk_get_n_pos(media_it->second.get());
+            idx += mtmd_input_chunk_get_n_tokens(media_it->second.get());
+        } else {
+            ++pos;
+            ++idx;
+        }
+
+        if (pos >= next) {
+            result.push_back({idx, pos});
+            next = pos + (llama_pos) page_positions;
+        }
+    }
+    return result;
+}
+
+bool server_tokens::complete_boundary(size_t count) const {
+    if (count > tokens.size()) {
+        return false;
+    }
+    // A chunk starting exactly at count is outside the retained prefix.
+    const auto next = map_idx_to_media.lower_bound(count);
+    if (next == map_idx_to_media.begin()) {
+        return true;
+    }
+    const auto prev = std::prev(next);
+    return prev->first + mtmd_input_chunk_get_n_tokens(prev->second.get()) <= count;
+}
+
+std::string server_tokens::cache_prefix_hash(size_t count) const {
+    GGML_ASSERT(count <= tokens.size());
+    std::vector<uint8_t> identity;
+    identity.reserve(count * sizeof(llama_token) + map_idx_to_media.size() * 96);
+    static constexpr uint32_t version = 1;
+    append_identity_scalar(identity, version);
+    append_identity_scalar(identity, count);
+
+    for (size_t idx = 0; idx < count;) {
+        const llama_token token = tokens[idx];
+        append_identity_scalar(identity, token);
+        const auto media_it = map_idx_to_media.find(idx);
+        if (media_it == map_idx_to_media.end()) {
+            GGML_ASSERT(token != LLAMA_TOKEN_NULL);
+            ++idx;
+            continue;
+        }
+
+        const auto identity_it = map_idx_to_media_identity.find(idx);
+        GGML_ASSERT(identity_it != map_idx_to_media_identity.end() && !identity_it->second.empty());
+        const auto * chunk = media_it->second.get();
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        GGML_ASSERT(idx + n_tokens <= count);
+        const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk);
+        const int32_t n_pos_per_embd = mtmd_input_chunk_get_n_pos_per_embd(chunk);
+        const bool use_non_causal = mtmd_input_chunk_get_use_non_causal(chunk);
+        const auto type = mtmd_input_chunk_get_type(chunk);
+        append_identity_scalar(identity, type);
+        append_identity_scalar(identity, n_tokens);
+        append_identity_scalar(identity, n_pos);
+        append_identity_scalar(identity, n_pos_per_embd);
+        append_identity_scalar(identity, use_non_causal);
+        const size_t digest_size = identity_it->second.size();
+        append_identity_scalar(identity, digest_size);
+        identity.insert(identity.end(), identity_it->second.begin(), identity_it->second.end());
+        for (size_t i = 1; i < n_tokens; ++i) {
+            append_identity_scalar(identity, tokens[idx + i]);
+        }
+        idx += n_tokens;
+    }
+
+    return hash_sha256_hex(identity.data(), identity.size());
+}
+
 std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
     auto it = map_idx_to_media.upper_bound(idx);
     if (it != map_idx_to_media.end()) {
@@ -632,6 +780,7 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
         }
         mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
         map_idx_to_media[start_idx] = std::move(new_chunk);
+        map_idx_to_media_identity[start_idx] = media_chunk_identity(chunk);
     } else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
         const auto * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
@@ -655,6 +804,7 @@ void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
             tokens.emplace_back(LLAMA_TOKEN_NULL);
         }
         map_idx_to_media[start_idx] = std::move(new_chunk);
+        map_idx_to_media_identity[start_idx] = media_chunk_identity(chunk);
     } else {
         push_back(chunk);
     }
@@ -662,17 +812,16 @@ void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
 
 void server_tokens::push_back(server_tokens & tokens) {
     size_t start_idx = size();
-    for (size_t i = 0; i < tokens.size(); i++) {
-        push_back(tokens[i]);
-    }
+    this->tokens.insert(this->tokens.end(), tokens.tokens.begin(), tokens.tokens.end());
     if (tokens.has_mtmd) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
         GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
-            auto * chunk = tokens.map_idx_to_media[it->first].get();
+        for (const auto & item : tokens.map_idx_to_media) {
+            auto * chunk = item.second.get();
             mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
-            map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
+            map_idx_to_media[start_idx + item.first] = std::move(new_chunk);
+            map_idx_to_media_identity[start_idx + item.first] = tokens.map_idx_to_media_identity.at(item.first);
         }
     }
 }
@@ -683,6 +832,11 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 
 const llama_tokens & server_tokens::get_tokens() const {
     GGML_ASSERT(!has_mtmd);
+    return tokens;
+}
+
+const llama_tokens & server_tokens::get_text_tokens_view() const {
+    GGML_ASSERT(!has_media());
     return tokens;
 }
 
@@ -744,6 +898,7 @@ server_tokens server_tokens::deserialize(const llama_tokens & packed, bool has_m
             throw std::runtime_error("Cannot load media chunk from server tokens state");
         }
         result.map_idx_to_media[start_idx] = std::move(chunk);
+        result.map_idx_to_media_identity[start_idx] = media_chunk_identity(result.map_idx_to_media[start_idx].get());
     }
 
     if (reader.remaining() >= sizeof(llama_token)) {
@@ -781,19 +936,17 @@ void server_tokens::keep_first(size_t n) {
         // n  1   2   3   4   5   6      7      8      9      10
         // allowed to resize      ^                    ^
         // disallowed to resize          ^      ^             ^
-        if (n > 0) {
-            // make sure we never remove tokens in the middle of an image
-            // note that the case where we keep a full image at the end is allowed:
-            //   tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] != LLAMA_TOKEN_NULL
-            if (tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] == LLAMA_TOKEN_NULL) {
-                find_chunk(n); // will throw an error if the cut is not at a chunk boundary
-            }
+        // NULL placeholders are contiguous even between distinct media chunks.
+        // Validate against complete chunk geometry, not neighboring token IDs.
+        if (!complete_boundary(n)) {
+            throw std::runtime_error("Cannot truncate inside a media chunk");
         }
         // remove all image chunks that are not used anymore
         for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ) {
             size_t idx = it->first;
             if (idx >= n) {
                 it = map_idx_to_media.erase(it);
+                map_idx_to_media_identity.erase(idx);
             } else {
                 ++it;
             }
@@ -915,6 +1068,7 @@ server_tokens server_tokens::clone() const {
         size_t idx = it->first;
         const mtmd::input_chunk_ptr & chunk = it->second;
         res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
+        res.map_idx_to_media_identity[idx] = map_idx_to_media_identity.at(idx);
     }
     return res;
 }
@@ -1046,6 +1200,157 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
+static std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return (char) std::tolower(c); });
+    return value;
+}
+
+static size_t visiontower_write(char * ptr, size_t size, size_t nmemb, void * user_data) {
+    auto * out = static_cast<std::vector<char> *>(user_data);
+    const size_t n = size * nmemb;
+    out->insert(out->end(), ptr, ptr + n);
+    return n;
+}
+
+static size_t visiontower_header(char * ptr, size_t size, size_t nmemb, void * user_data) {
+    auto * headers = static_cast<std::map<std::string, std::string> *>(user_data);
+    const size_t n = size * nmemb;
+    std::string line(ptr, ptr + n);
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos) {
+        return n;
+    }
+    std::string key = lowercase(line.substr(0, colon));
+    std::string value = line.substr(colon + 1);
+    while (!value.empty() && std::isspace((unsigned char) value.front())) value.erase(value.begin());
+    while (!value.empty() && std::isspace((unsigned char) value.back())) value.pop_back();
+    (*headers)[key] = value;
+    return n;
+}
+
+visiontower_encode_result visiontower_encode(
+        const std::string & base_url,
+        bool is_video,
+        const raw_buffer & bytes) {
+    std::string root = base_url;
+    while (!root.empty() && root.back() == '/') root.pop_back();
+    const std::string url = root + "/v1/vision/encode";
+
+    CURL * curl = curl_easy_init();
+    if (!curl) {
+        throw std::runtime_error("failed to initialize visiontower HTTP client");
+    }
+    std::vector<char> body;
+    std::map<std::string, std::string> headers;
+    curl_mime * mime = nullptr;
+    try {
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, visiontower_write);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, visiontower_header);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 900L);
+
+        mime = curl_mime_init(curl);
+        auto add_string = [&](const char * name, const char * value) {
+            curl_mimepart * part = curl_mime_addpart(mime);
+            curl_mime_name(part, name);
+            curl_mime_data(part, value, CURL_ZERO_TERMINATED);
+        };
+        add_string("type", is_video ? "video" : "image");
+        add_string("dtype", "fp16");
+        curl_mimepart * file = curl_mime_addpart(mime);
+        curl_mime_name(file, "file");
+        curl_mime_data(file, (const char *) bytes.data(), bytes.size());
+        curl_mime_filename(file, is_video ? "input.mp4" : "input.png");
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+
+        const CURLcode result = curl_easy_perform(curl);
+        if (result != CURLE_OK) {
+            throw std::runtime_error(std::string("visiontower request failed: ") + curl_easy_strerror(result));
+        }
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        if (status < 200 || status >= 300) {
+            throw std::runtime_error("visiontower request returned HTTP " + std::to_string(status));
+        }
+    } catch (...) {
+        if (mime) curl_mime_free(mime);
+        curl_easy_cleanup(curl);
+        throw;
+    }
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+
+    auto required = [&](const char * name) -> const std::string & {
+        const auto it = headers.find(lowercase(name));
+        if (it == headers.end()) {
+            throw std::runtime_error(std::string("visiontower response missing header ") + name);
+        }
+        return it->second;
+    };
+
+    visiontower_encode_result out;
+    out.n_tokens = (uint32_t) std::stoul(required("x-n-visual-tokens"));
+    out.n_embd = (size_t) std::stoull(required("x-hidden-size"));
+    out.n_pos_per_embd = std::stoi(required("x-n-pos-per-embd"));
+    out.n_pos = (llama_pos) std::stol(required("x-n-pos"));
+    if (out.n_tokens == 0 || out.n_embd == 0 || out.n_pos_per_embd <= 0 || out.n_pos <= 0
+            || out.n_embd > std::numeric_limits<size_t>::max() / out.n_tokens
+            || (size_t) out.n_pos_per_embd > std::numeric_limits<size_t>::max() / out.n_tokens) {
+        throw std::runtime_error("visiontower returned invalid embedding geometry");
+    }
+    if (auto it = headers.find("x-requires-non-causal-attn"); it != headers.end()) {
+        out.use_non_causal = it->second == "1";
+    }
+    if (auto it = headers.find("x-sha256"); it != headers.end()) {
+        out.sha256 = it->second;
+    }
+    if (auto it = headers.find("x-mm-type"); it != headers.end()) {
+        const bool response_is_video = lowercase(it->second) == "video";
+        if (response_is_video != is_video) {
+            throw std::runtime_error("visiontower response modality does not match request");
+        }
+    }
+
+    const size_t n_values = (size_t) out.n_tokens * out.n_embd;
+    out.embd.resize(n_values);
+    const std::string dtype = headers.count("x-dtype") ? lowercase(headers.at("x-dtype")) : "fp16";
+    if (dtype == "fp16") {
+        if (body.size() != n_values * sizeof(ggml_fp16_t)) {
+            throw std::runtime_error("visiontower fp16 embedding body has wrong size");
+        }
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *) body.data(), out.embd.data(), n_values);
+    } else if (dtype == "fp32") {
+        if (body.size() != n_values * sizeof(float)) {
+            throw std::runtime_error("visiontower fp32 embedding body has wrong size");
+        }
+        std::memcpy(out.embd.data(), body.data(), body.size());
+    } else {
+        throw std::runtime_error("visiontower returned unsupported embedding dtype " + dtype);
+    }
+
+    common_remote_params params;
+    params.timeout = 120;
+    params.max_size = 256L * 1024L * 1024L;
+    std::string pos_path = required("x-pos-path");
+    const std::string pos_url = string_starts_with(pos_path, "http")
+        ? pos_path
+        : root + (pos_path.empty() || pos_path.front() == '/' ? "" : "/") + pos_path;
+    auto pos_response = common_remote_get_content(pos_url, params);
+    if (pos_response.first < 200 || pos_response.first >= 300) {
+        throw std::runtime_error("visiontower position fetch failed");
+    }
+    const size_t n_pos = (size_t) out.n_tokens * out.n_pos_per_embd;
+    if (pos_response.second.size() != n_pos * sizeof(int32_t)) {
+        throw std::runtime_error("visiontower position body has wrong size");
+    }
+    out.pos.resize(n_pos);
+    std::memcpy(out.pos.data(), pos_response.second.data(), pos_response.second.size());
+    return out;
+}
+
 server_tokens process_mtmd_prompt(
         mtmd_context * mctx,
         const std::string & prompt,
@@ -1055,8 +1360,29 @@ server_tokens process_mtmd_prompt(
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
-    for (auto & file : files) {
-        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+    for (const auto & file : files) {
+        const bool is_video = is_tagged_video(file);
+        const bool is_audio = is_tagged_audio(file)
+            || (!is_video && !is_tagged_audio(file) && looks_like_audio(file));
+        const size_t prefix_size = (is_video || is_tagged_audio(file)) ? sizeof(MTMD_VIDEO_PREFIX) : 0;
+        raw_buffer payload(file.begin() + prefix_size, file.end());
+        const char * visiontower_url = mtmd_get_visiontower_url(mctx);
+        if (!is_audio && visiontower_url && visiontower_url[0] != '\0') {
+            auto encoded = visiontower_encode(visiontower_url, is_video, payload);
+            mtmd::bitmap bitmap(mtmd_bitmap_init_from_embd(
+                encoded.n_tokens, encoded.n_pos, encoded.n_pos_per_embd,
+                encoded.embd.data(), encoded.n_embd, encoded.pos.data(),
+                is_video, encoded.use_non_causal));
+            if (!bitmap.ptr) {
+                throw std::runtime_error("Failed to construct external media embedding");
+            }
+            if (!encoded.sha256.empty()) {
+                bitmap.set_id(encoded.sha256.c_str());
+            }
+            bitmaps.entries.emplace_back(std::move(bitmap));
+            continue;
+        }
+        auto out = mtmd_helper_bitmap_init_from_buf(mctx, payload.data(), payload.size(), is_placeholder, init_opt);
         if (!out.bitmap) {
             throw std::runtime_error("Failed to load image or audio file");
         }
@@ -1118,7 +1444,23 @@ server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context *
             // JSON object with prompt and multimodal key.
             std::vector<raw_buffer> files;
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
-                files.push_back(base64_decode(entry));
+                if (!entry.is_string()) {
+                    throw std::runtime_error("multimodal_data entries must be strings");
+                }
+                const std::string value = entry.get<std::string>();
+                if (string_starts_with(value, "data:")) {
+                    const auto parts = string_split<std::string>(value, ',');
+                    if (parts.size() != 2 || !string_ends_with(parts[0], "base64")) {
+                        throw std::runtime_error("multimodal_data contains an invalid data URL");
+                    }
+                    const bool is_video = string_starts_with(parts[0], "data:video/");
+                    if (!is_video && !string_starts_with(parts[0], "data:image/")) {
+                        throw std::runtime_error("multimodal_data MIME type is not supported");
+                    }
+                    files.push_back(tag_media(base64_decode(parts[1]), is_video));
+                } else {
+                    files.push_back(base64_decode(value));
+                }
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files, init_opt);
         } else {
@@ -1195,10 +1537,10 @@ json oaicompat_completion_params_parse(const json & body) {
 // - file:// for local files (only allowed if media_path is set)
 // - data: for base64 encoded data with uri scheme (e.g. data:image/png;base64,...)
 // - raw base64 encoded data
-void handle_media(
+static void handle_media(
         std::vector<raw_buffer> & out_files,
         const std::string & url,
-        const std::string & media_path) {
+        const std::string & media_path, bool is_video, bool is_audio) {
     if (!media_path.empty()) {
         // should already be enforced by arg.cpp, but checking just in case
         GGML_ASSERT(media_path.back() == DIRECTORY_SEPARATOR);
@@ -1216,7 +1558,7 @@ void handle_media(
             SRV_INF("downloaded %zu bytes\n", res.second.size());
             raw_buffer data;
             data.insert(data.end(), res.second.begin(), res.second.end());
-            out_files.push_back(data);
+            out_files.push_back(tag_media(std::move(data), is_video, is_audio));
         } else {
             throw std::runtime_error("Failed to download image");
         }
@@ -1237,7 +1579,7 @@ void handle_media(
             throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
         }
         data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        out_files.push_back(data);
+        out_files.push_back(tag_media(std::move(data), is_video, is_audio));
 
     } else if (string_starts_with(url, "data:")) {
         // try to decode base64 image, video, or audio
@@ -1253,7 +1595,7 @@ void handle_media(
         } else {
             auto base64_data = parts[1];
             auto decoded_data = base64_decode(base64_data);
-            out_files.push_back(decoded_data);
+            out_files.push_back(tag_media(std::move(decoded_data), is_video, is_audio));
         }
 
     } else {
@@ -1262,8 +1604,12 @@ void handle_media(
         if (decoded_data.empty()) {
             throw std::runtime_error("Invalid base64 value");
         }
-        out_files.push_back(decoded_data);
+        out_files.push_back(tag_media(std::move(decoded_data), is_video, is_audio));
     }
+}
+
+void handle_media(std::vector<raw_buffer> & out_files, const std::string & url, const std::string & media_path) {
+    handle_media(out_files, url, media_path, string_starts_with(url, "data:video/"), string_starts_with(url, "data:audio/"));
 }
 
 // load media files from an OAI content array, then replace each media part with a media marker text part
@@ -1277,7 +1623,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
 
             json image_url = json_value(p, "image_url", json::object());
             std::string url = json_value(image_url, "url", std::string());
-            handle_media(out_files, url, opt.media_path);
+            handle_media(out_files, url, opt.media_path, false, false);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
@@ -1292,7 +1638,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             json input_audio = json_value(p, "input_audio", json::object());
             std::string url  = json_value(input_audio, "data",
                                     json_value(input_audio, "url", std::string()));
-            handle_media(out_files, url, opt.media_path);
+            handle_media(out_files, url, opt.media_path, false, true);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
@@ -1307,7 +1653,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             json input_video = json_value(p, type, json::object());
             std::string url  = json_value(input_video, "data",
                                     json_value(input_video, "url", std::string()));
-            handle_media(out_files, url, opt.media_path);
+            handle_media(out_files, url, opt.media_path, true, false);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();

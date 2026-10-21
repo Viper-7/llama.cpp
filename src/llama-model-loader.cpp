@@ -1117,6 +1117,13 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    return create_tensor_as(hparams, buft_list_cpu, buft_list_input, buft_list_output, buft_list_layer, tn, tn, ne, flags);
+}
+
+struct ggml_tensor * llama_model_loader::create_tensor_as(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & source_tn, const LLM_TN_IMPL & placement_tn,
+        const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
@@ -1127,7 +1134,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (it == ctx_map.end()) {
             // one ggml context per buffer type
             int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                   // duplicated output tensor
+            max_n_tensors += 2;                   // duplicated output tensors
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
@@ -1157,14 +1164,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
             }
-            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+            throw std::runtime_error(format("missing tensor '%s'", source_tn.str().c_str()));
         }
 
         // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
         // the tensor is duplicated
         // to handle this, we check if the tensor is duplicated, and if so, we assume that it is being loaded as the output tensor
-        llm_tensor tn_tensor = tn.tensor;
-        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+        llm_tensor tn_tensor = placement_tn.tensor;
+        if (placement_tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
             tn_tensor = LLM_TENSOR_OUTPUT;
         }
 
@@ -1172,13 +1179,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         try {
             info = llm_tensor_info_for(tn_tensor);
         } catch (const std::out_of_range & e) {
-            throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
+            throw std::runtime_error(format("missing tensor info mapping for %s", placement_tn.str().c_str()));
         }
 
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", source_tn.str().c_str(), nbytes);
 
             size_data -= nbytes;
             n_created++;
@@ -1189,10 +1196,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
         // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+        if (placement_tn.suffix != nullptr && strcmp(placement_tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
-        } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
-                (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
+        } else if (hparams.router_layer >= 0 && placement_tn.suffix != nullptr &&
+                (strcmp(placement_tn.suffix, "lora_a") == 0 || strcmp(placement_tn.suffix, "lora_b") == 0)) {
             op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
@@ -1200,12 +1207,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
-            if (tn.bid != -1) {
-                GGML_ABORT("input/output layer tensor %s used with a layer number", tn.str().c_str());
+            if (placement_tn.bid != -1) {
+                GGML_ABORT("input/output layer tensor %s used with a layer number", placement_tn.str().c_str());
             }
         } else {
-            if (tn.bid == -1) {
-                GGML_ABORT("repeating layer tensor %s used without a layer number", tn.str().c_str());
+            if (placement_tn.bid == -1) {
+                GGML_ABORT("repeating layer tensor %s used without a layer number", placement_tn.str().c_str());
             }
         }
 
@@ -1227,14 +1234,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 buft_list = buft_list_layer;
                 break;
             default:
-                GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+                GGML_ABORT("invalid layer %d for tensor %s", info.layer, placement_tn.str().c_str());
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
 
         // check overrides
         if (tensor_buft_overrides) {
-            std::string tensor_name = tn.str();
+            std::string tensor_name = placement_tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
@@ -1263,7 +1270,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
-                throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+                throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", placement_tn.str().c_str()));
             }
         }
 
@@ -1295,7 +1302,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
         ggml_type type = GGML_TYPE_F32;
-        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+        const int64_t tid = gguf_find_tensor(metadata, source_tn.str().c_str());
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
         }
@@ -1324,25 +1331,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
             GGML_ASSERT(t_meta.nb[dim] >= 1);
         }
-        ggml_set_name(&t_meta, tn.str().c_str());
+        ggml_set_name(&t_meta, source_tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
-        ggml_set_name(ret, tn.str().c_str());
+        ggml_set_name(ret, source_tn.str().c_str());
         return ret;
     }
 
-    LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
-    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
+    LLAMA_LOG_DEBUG("%s: loading tensor %s as %s\n", __func__, source_tn.str().c_str(), placement_tn.str().c_str());
+    const struct ggml_tensor * cur = check_tensor_dims(source_tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
     }
 
     if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = lazy.add(source_tn.str(), cur, no_alloc ? nullptr : &require_weight(source_tn.str().c_str()));
     }
 
     ggml_tensor t_meta = *cur;
@@ -1370,7 +1377,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
-        ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+        ggml_tensor * t = ggml_get_tensor(ctx, source_tn.str().c_str());
         if (t) {
             return t;
         }

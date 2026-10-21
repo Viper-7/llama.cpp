@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -193,6 +195,8 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
+    /* .event_new_timing     = */ nullptr,
+    /* .event_elapsed_time   = */ nullptr,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -574,6 +578,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis != concat_axis) {
             return src_ss[0];
+        }
+        if (src_ss[0].axis == concat_axis && src_ss[1].axis == concat_axis) {
+            GGML_ASSERT(src_ss[0].n_segments + src_ss[1].n_segments <= 16);
+            ggml_backend_meta_split_state ret = src_ss[0];
+            for (size_t s = 0; s < src_ss[1].n_segments; ++s) {
+                const size_t dst_s = src_ss[0].n_segments + s;
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    ret.ne[dst_s*n_bufs + j] = src_ss[1].ne[s*n_bufs + j];
+                }
+                ret.nr[dst_s] = src_ss[1].nr[s];
+            }
+            ret.n_segments += src_ss[1].n_segments;
+            return ret;
         }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
@@ -1076,12 +1093,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_GLU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
+            case GGML_OP_TURBO_WHT: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             } break;
         }
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        const bool concat_preserves_segments = tensor->op == GGML_OP_CONCAT &&
+                split_state.axis == ggml_backend_meta_split_axis(ggml_get_op_params_i32(tensor, 0));
+        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS && !concat_preserves_segments) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
@@ -1816,6 +1838,7 @@ struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
         int           offset      = 0; // Node offset vs. original graph
+        bool          allreduce_delayed = false;
 
         std::vector<ggml_cgraph *> cgraphs_aux;
     };
@@ -1841,11 +1864,14 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+    bool                        collective_stats = false;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+        const char * value = std::getenv("GGML_META_COLLECTIVE_STATS");
+        collective_stats = value && std::atoi(value) != 0;
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
         name = "Meta(";
@@ -2045,6 +2071,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
+        auto is_passthrough_host_view = [](const ggml_tensor * node) {
+            if (node->view_src == nullptr) {
+                return false;
+            }
+            if (!ggml_backend_buffer_is_meta(node->buffer)) {
+                return node->buffer != nullptr && ggml_backend_buffer_is_host(node->buffer);
+            }
+            return node->view_src->op == GGML_OP_NONE &&
+                    node->view_src->buffer != nullptr && ggml_backend_buffer_is_host(node->view_src->buffer);
+        };
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
 
@@ -2076,6 +2113,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (is_passthrough_host_view(next)) {
+                            id++;
+                            continue;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -2085,6 +2126,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 continue;
                             }
                             if (next->src[s] == node) {
+                                safe = false;
+                                break;
+                            }
+                            if (is_passthrough_host_view(next->src[s])) {
                                 safe = false;
                                 break;
                             }
@@ -2185,7 +2230,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
 
-                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    if (is_passthrough_host_view(next)) {
                         continue;
                     }
                     if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -2224,7 +2269,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (is_passthrough_host_view(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
@@ -2237,6 +2282,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 const int i_delayed = get_i_delayed(i);
+                const bool allreduce_delayed = i_delayed > i;
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -2258,6 +2304,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
+                    bcj.cgraphs[n_subgraphs].allreduce_delayed = allreduce_delayed;
                 }
                 n_subgraphs++;
                 i_start = i + 1;
@@ -2475,6 +2522,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    uint64_t collective_calls = 0;
+    uint64_t collective_bytes_per_rank = 0;
+    uint64_t collective_bytes_all_ranks = 0;
+    uint64_t collective_immediate_calls = 0;
+    uint64_t collective_delayed_calls = 0;
+    uint64_t collective_fast_calls = 0;
+    uint64_t collective_fallback_calls = 0;
+    uint64_t collective_submit_us = 0;
+    uint64_t collective_f32_calls = 0;
+    uint64_t collective_f16_calls = 0;
+    uint64_t collective_bf16_calls = 0;
+    uint64_t collective_other_calls = 0;
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2485,6 +2545,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            ggml_cgraph * cgraph_i0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+            ggml_tensor * logical_tensor = cgraph_i0->nodes[cgraph_i0->n_nodes - 1];
+            const uint64_t bytes_per_rank = ggml_nbytes(logical_tensor);
+            const int64_t t_submit = backend_ctx->collective_stats ? ggml_time_us() : 0;
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2503,7 +2567,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+            if (backend_ctx->collective_stats) {
+                collective_calls++;
+                collective_bytes_per_rank += bytes_per_rank;
+                collective_bytes_all_ranks += bytes_per_rank*n_backends;
+                collective_submit_us += ggml_time_us() - t_submit;
+                backend_allreduce_success ? collective_fast_calls++ : collective_fallback_calls++;
+                backend_ctx->backend_configs[0].cgraphs[i].allreduce_delayed ? collective_delayed_calls++ : collective_immediate_calls++;
+                switch (logical_tensor->type) {
+                    case GGML_TYPE_F32:  collective_f32_calls++;  break;
+                    case GGML_TYPE_F16:  collective_f16_calls++;  break;
+                    case GGML_TYPE_BF16: collective_bf16_calls++; break;
+                    default:             collective_other_calls++; break;
+                }
+            }
         }
+    }
+    if (backend_ctx->collective_stats && collective_calls > 0) {
+        GGML_LOG_INFO("ggml_meta_collective: calls=%" PRIu64 " bytes_per_rank=%" PRIu64 " bytes_all_ranks=%" PRIu64 " immediate=%" PRIu64 " delayed=%" PRIu64 " fast=%" PRIu64 " fallback=%" PRIu64 " submit_us=%" PRIu64 " types=[f32:%" PRIu64 ",f16:%" PRIu64 ",bf16:%" PRIu64 ",other:%" PRIu64 "]\n",
+                collective_calls, collective_bytes_per_rank, collective_bytes_all_ranks, collective_immediate_calls, collective_delayed_calls,
+                collective_fast_calls, collective_fallback_calls, collective_submit_us, collective_f32_calls, collective_f16_calls, collective_bf16_calls, collective_other_calls);
     }
     return GGML_STATUS_SUCCESS;
 }

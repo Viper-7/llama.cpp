@@ -1725,6 +1725,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-page-ram"}, "N",
+        string_format("set the process-local range-state page cache size in MiB (default: %d, 0 = disabled)", params.cache_page_ram_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-page-ram must be non-negative");
+            }
+            params.cache_page_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PAGE_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-page-tokens"}, "N",
+        string_format("set the number of tokens per range-state cache page (default: %d)", params.cache_page_tokens),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("cache-page-tokens must be positive");
+            }
+            params.cache_page_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PAGE_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
@@ -3680,6 +3700,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--visiontower-url"}, "URL",
+        "[AI] base URL for an external vision tower encode service (enables server-side image/video embedding injection; default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.visiontower_url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VISIONTOWER_URL"));
+    add_opt(common_arg(
         {"--models-dir"}, "PATH",
         "directory containing models for the router server (default: disabled)",
         [](common_params & params, const std::string & value) {
@@ -4186,7 +4213,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.speculative.draft.n_max = value;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
@@ -4320,7 +4347,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             auto types = common_speculative_types_from_names(types_str);
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),

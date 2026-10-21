@@ -1277,6 +1277,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    int profile_mode = -1;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1445,10 +1446,38 @@ struct ggml_cuda_stream_context {
     }
 };
 
+static constexpr int GGML_CUDA_COPY_STAGING_SLOTS = 4;
+
+struct ggml_cuda_copy_staging_slot {
+    void * host = nullptr;
+    size_t capacity = 0;
+    cudaEvent_t src_ready = nullptr;
+    cudaEvent_t dst_done = nullptr;
+    cudaEvent_t d2h_start = nullptr;
+    cudaEvent_t d2h_stop = nullptr;
+    cudaEvent_t h2d_start = nullptr;
+    cudaEvent_t h2d_stop = nullptr;
+    int dst_device = -1;
+    bool used = false;
+    bool timing_pending = false;
+    size_t timing_bytes = 0;
+    uint64_t sequence = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    std::mutex copy_staging_mutex;
+    ggml_cuda_copy_staging_slot copy_staging[GGML_CUDA_MAX_DEVICES][GGML_CUDA_COPY_STAGING_SLOTS];
+    uint64_t copy_staging_sequence = 0;
+    uint64_t copy_staging_reuses[GGML_CUDA_MAX_DEVICES] = {};
+    uint64_t copy_staging_completed_reuses[GGML_CUDA_MAX_DEVICES] = {};
+    uint64_t copy_staging_forced_drains[GGML_CUDA_MAX_DEVICES] = {};
+    uint64_t copy_staging_timing_copies[GGML_CUDA_MAX_DEVICES] = {};
+    uint64_t copy_staging_timing_bytes[GGML_CUDA_MAX_DEVICES] = {};
+    double copy_staging_timing_d2h_us[GGML_CUDA_MAX_DEVICES] = {};
+    double copy_staging_timing_h2d_us[GGML_CUDA_MAX_DEVICES] = {};
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

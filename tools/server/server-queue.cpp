@@ -22,7 +22,7 @@
 //
 
 static bool task_resets_idle_timer(server_task_type type) {
-    return type != SERVER_TASK_TYPE_METRICS;
+    return type != SERVER_TASK_TYPE_METRICS && type != SERVER_TASK_TYPE_RESPONSES_CONTEXT;
 }
 
 int server_queue::post(server_task && task, bool front) {
@@ -45,6 +45,18 @@ int server_queue::post(server_task && task, bool front) {
     }
     condition_tasks.notify_one();
     return task_id;
+}
+
+bool server_queue::post_if_awake(server_task && task, bool front) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (sleeping || !running) return false;
+    GGML_ASSERT(task.id != -1);
+    const bool reset_timer = task_resets_idle_timer(task.type);
+    if (front) queue_tasks.push_front(std::move(task));
+    else queue_tasks.push_back(std::move(task));
+    if (reset_timer) time_last_task = ggml_time_ms();
+    condition_tasks.notify_one();
+    return true;
 }
 
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
@@ -90,23 +102,24 @@ int server_queue::get_new_id() {
 void server_queue::pop_deferred_task(int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!queue_tasks_deferred.empty()) {
-        // try to find a task that uses the specified slot
-        bool found = false;
+        // Preserve slot affinity, then prefer interactive work within that
+        // class. Iteration order keeps FIFO among equally ranked requests.
+        auto selected = queue_tasks_deferred.end();
         for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
-            if (it->id_slot == id_slot) {
-                QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
-                queue_tasks.emplace_front(std::move(*it));
-                queue_tasks_deferred.erase(it);
-                found = true;
-                break;
+            const bool matching_slot = it->id_slot == id_slot;
+            const bool selected_matches = selected != queue_tasks_deferred.end() && selected->id_slot == id_slot;
+            const bool interactive = it->params.cache_control.priority == server_cache_priority::interactive;
+            const bool selected_interactive = selected != queue_tasks_deferred.end() &&
+                selected->params.cache_control.priority == server_cache_priority::interactive;
+            if (selected == queue_tasks_deferred.end() ||
+                    (matching_slot && !selected_matches) ||
+                    (matching_slot == selected_matches && interactive && !selected_interactive)) {
+                selected = it;
             }
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
-        if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
-            queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
-            queue_tasks_deferred.pop_front();
-        }
+        QUE_DBG("pop deferred task, id_task = %d, slot = %d\n", selected->id, id_slot);
+        queue_tasks.emplace_front(std::move(*selected));
+        queue_tasks_deferred.erase(selected);
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
@@ -521,6 +534,20 @@ void server_response_reader::post_task(server_task && task, bool front) {
     states.push_back(task_result_state());
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
+}
+
+bool server_response_reader::post_task_if_awake(server_task && task, bool front) {
+    GGML_ASSERT(id_tasks.empty() && !task.is_parent());
+    task.index = 0;
+    const int id = task.id;
+    id_tasks.insert(id);
+    states.push_back(task_result_state());
+    queue_results.add_waiting_task_id(id);
+    if (queue_tasks.post_if_awake(std::move(task), front)) return true;
+    queue_results.remove_waiting_task_id(id);
+    id_tasks.clear();
+    states.clear();
+    return false;
 }
 
 void server_response_reader::post_tasks(std::vector<server_task> && tasks, const common_chat_session & session, bool front) {

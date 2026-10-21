@@ -581,6 +581,21 @@ ggml_tensor * clip_graph::build_inp() {
     return inp;
 }
 
+ggml_tensor * clip_graph::build_video_inp() {
+    GGML_ASSERT(model.video_patch_embeddings != nullptr);
+    GGML_ASSERT(n_batch == 2);
+    ggml_tensor * inp_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img.nx(), img.ny(), 6, 1);
+    ggml_set_name(inp_raw, "inp_raw");
+    ggml_set_input(inp_raw);
+    ggml_tensor * video_patch_embeddings = model.video_patch_embeddings;
+    if (video_patch_embeddings->type != GGML_TYPE_F16 && video_patch_embeddings->type != GGML_TYPE_F32) {
+        video_patch_embeddings = ggml_cast(ctx0, video_patch_embeddings, GGML_TYPE_F16);
+    }
+    ggml_tensor * inp = ggml_conv_2d(ctx0, video_patch_embeddings, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+    inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
+    return ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+}
+
 ggml_tensor * clip_graph::build_inp_raw(int channels) {
     ggml_tensor * inp_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img.nx(), img.ny(), channels, n_batch);
     ggml_set_name(inp_raw, "inp_raw");
@@ -697,6 +712,19 @@ ggml_tensor * clip_graph::build_ffn(
                 cur = ggml_relu(ctx0, cur);
                 cur = ggml_sqr(ctx0, cur);
                 cb(cur, "ffn_relu_sqr", il);
+            } break;
+        case FFN_SILU_CLAMP:
+            {
+                // not ggml_swiglu_oai: it clamps the same way but adds one to the up branch
+                GGML_ASSERT(gate && "FFN_SILU_CLAMP is a gated activation");
+                const float limit = hparams.swiglu_limit;
+                GGML_ASSERT(limit > 0.0f);
+                tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+                cb(tmp, "ffn_up_clamped", il);
+                cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                cb(cur, "ffn_gate_clamped", il);
+                cur = ggml_swiglu_split(ctx0, cur, tmp);
+                cb(cur, "ffn_swiglu_limited", il);
             } break;
     }
 
@@ -1128,6 +1156,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
         case PROJECTOR_TYPE_GLM5V:
             {
                 builder = std::make_unique<clip_graph_glm4v>(ctx, img);
+            } break;
+        case PROJECTOR_TYPE_GLM5NEXT:
+            {
+                builder = std::make_unique<clip_graph_glm5next>(ctx, img);
             } break;
         case PROJECTOR_TYPE_QWEN3A:
             {
@@ -1916,6 +1948,20 @@ struct clip_model_loader {
                         hparams.set_limit_image_tokens(8, 4096);
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
+                case PROJECTOR_TYPE_GLM5NEXT:
+                    {
+                        hparams.rope_theta = 10000.0f;
+                        hparams.n_merge = 2;
+                        // the reference asks for PILImageResampling.BICUBIC, which this only approximates
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
+                        hparams.ffn_op = FFN_SILU_CLAMP;
+                        log_ffn_op = "silu_clamp";
+                        // the preprocessor's min_pixels/max_pixels, in tokens
+                        hparams.set_limit_image_tokens(16, 8000);
+                        hparams.set_warmup_n_tokens(46*46);
+                    } break;
                 case PROJECTOR_TYPE_GLM5V:
                     {
                         // glm4v tower with clamped SwiGLU, ceil-aligned resize and its own token budget
@@ -2426,6 +2472,7 @@ struct clip_model_loader {
         model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
         model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   false);
         model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
+        model.video_patch_embeddings = get_tensor(TN_VIDEO_PATCH_EMBD, false);
 
         model.norm_embd_w = get_tensor(string_format(TN_NORM_EMBD, "weight"), false);
         model.norm_embd_b = get_tensor(string_format(TN_NORM_EMBD, "bias"),   false);
@@ -2812,6 +2859,7 @@ struct clip_model_loader {
                     }
                 } break;
             case PROJECTOR_TYPE_GLM4V:
+            case PROJECTOR_TYPE_GLM5NEXT:
             case PROJECTOR_TYPE_GLM5V:
                 {
                     model.mm_fc_w        = get_tensor(string_format(TN_MM_PROJECTOR, "weight"));
@@ -4319,6 +4367,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_GLM5V:
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_HUNYUANVL:
@@ -4349,6 +4398,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_GLM5V:
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_HUNYUANVL:
@@ -4435,6 +4485,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_MINIMAX_M3:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_GLM5V:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
@@ -5193,6 +5244,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_GLM5V:
             {
                 const int merge_ratio = hparams.n_merge;
@@ -6437,6 +6489,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_GRANITE4_VISION:
             return ctx->model.qf_proj_blocks.size() * ctx->model.hparams.projection_dim;
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_GLM5V:
             return ctx->model.mm_ffn_down_w->ne[1];
         case PROJECTOR_TYPE_MIMO_AUDIO:
@@ -6483,6 +6536,8 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LING3VL:
             return 2;
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+            return ctx->model.video_patch_embeddings != nullptr ? 2 : 1;
         default:
             return 1;
     }

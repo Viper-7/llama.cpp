@@ -79,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+      ggml_backend_dev_t     dev_override) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -214,7 +215,7 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            auto * dev = dev_override ? dev_override : model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
@@ -1242,6 +1243,18 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+void llama_kv_cache::set_kpool_dirty() {
+    kpool_dirty = true;
+}
+
+bool llama_kv_cache::get_kpool_dirty() const {
+    return kpool_dirty;
+}
+
+void llama_kv_cache::clear_kpool_dirty() const {
+    kpool_dirty = false;
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }
@@ -1380,6 +1393,30 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // store the current K values into the cache
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+        int64_t n_embd, int64_t i_off) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * k = layers[ikv].k;
+
+    const int64_t n_embd_gqa = k->ne[0];
+    const int64_t kv_size    = get_size();
+    const int64_t n_stream   = k->ne[2];
+
+    GGML_ASSERT(i_off >= 0 && i_off + n_embd <= n_embd_gqa);
+    GGML_ASSERT(k_cur->ne[0] == n_embd);
+
+    // merge the streams: k_idxs are global, exactly as in cpy_k
+    ggml_tensor * k2 = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+
+    // a row-slice view of every cell. ggml_set_rows needs contiguous rows in the DEST,
+    // which ggml_is_contiguous_rows() grants for a view whose ne[0] slice is contiguous.
+    ggml_tensor * dst = ggml_view_2d(ctx, k2, n_embd, kv_size*n_stream,
+            k2->nb[1], ggml_row_size(k2->type, i_off));
+
+    return ggml_set_rows(ctx, dst, k_cur, k_idxs);
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2071,6 +2108,15 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    state_write_range(io, seq_id, flags, -1, -1);
+}
+
+void llama_kv_cache::state_write_range(
+        llama_io_write_i & io,
+           llama_seq_id   seq_id,
+  llama_state_seq_flags   flags,
+             llama_pos   p0,
+             llama_pos   p1) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2098,6 +2144,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && (p0 < 0 || cells.pos_get(i) >= p0);
+            add_cell = add_cell && (p1 < 0 || cells.pos_get(i) <  p1);
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
@@ -2201,7 +2249,8 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr,
+                flags & LLAMA_STATE_SEQ_FLAGS_APPEND_INTERNAL);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2354,7 +2403,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(
+        llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2365,7 +2415,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        seq_rm(dest_seq_id, -1, -1);
+        if (!append) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2432,8 +2484,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             sinfo.s1 = strm;
             sinfo.strm[0] = strm;
 
-            // seq_rm above freed exactly the cells this sequence held
-            // anything else in the way is a cache that had already drifted, which this restore must not hide
+            // Anything in the way means the mirrored cache had already drifted.
             for (uint32_t i = 0; i < cell_count; ++i) {
                 const uint32_t idx = sinfo.idxs[0][i];
 
@@ -2815,8 +2866,14 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+        llama_kv_cache * kv) : llama_kv_cache_context(kv, kv->get_size()) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t n_kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), n_kv(n_kv) {
+    GGML_ASSERT(n_kv > 0 && n_kv <= kv->get_size());
+    GGML_ASSERT(n_kv == kv->get_size() || (n_kv >= 256 && n_kv % 256 == 0));
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2897,6 +2954,22 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
+uint32_t llama_kv_cache_context::get_n_stream() const {
+    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
+}
+
+uint32_t llama_kv_cache_context::get_strm(uint32_t s) const {
+    const auto & sinfo = sinfos[i_cur];
+
+    GGML_ASSERT(s < sinfo.strm.size());
+
+    return sinfo.strm[s];
+}
+
+const llama_kv_cache * llama_kv_cache_context::get_kv() const {
+    return kv;
+}
+
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
@@ -2907,6 +2980,11 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+        int64_t n_embd, int64_t i_off) const {
+    return kv->cpy_k_part(ctx, k_cur, k_idxs, il, n_embd, i_off);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {

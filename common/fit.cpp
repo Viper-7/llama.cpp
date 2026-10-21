@@ -176,6 +176,45 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+static std::vector<llama_device_memory_data> common_get_extra_device_memory_data(
+        const common_fit_extra_model * extra,
+        const std::vector<ggml_backend_dev_t> & devs,
+        uint32_t n_ctx,
+        ggml_log_level log_level) {
+    GGML_ASSERT(extra != nullptr);
+
+    std::vector<ggml_backend_dev_t> devs_extra;
+    uint32_t ngl_extra = 0;
+    uint32_t nct_extra = 0;
+    uint32_t nex_extra = 0;
+
+    extra->cparams->n_ctx = n_ctx;
+
+    const std::vector<llama_device_memory_data> measured = common_get_device_memory_data_impl(
+            extra->path_model, extra->mparams, extra->cparams,
+            devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+
+    std::vector<llama_device_memory_data> result(devs.size() + 1);
+    result.back().mb = measured.back().mb;
+    for (size_t je = 0; je < devs_extra.size(); je++) {
+        for (size_t id = 0; id < devs.size(); id++) {
+            if (devs_extra[je] == devs[id]) {
+                result[id].mb.model   += measured[je].mb.model;
+                result[id].mb.context += measured[je].mb.context;
+                result[id].mb.compute += measured[je].mb.compute;
+                break;
+            }
+        }
+    }
+    if (extra->shares_model) {
+        for (llama_device_memory_data & dmd : result) {
+            dmd.mb.model = 0;
+        }
+    }
+
+    return result;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -208,44 +247,17 @@ static void common_params_fit_impl(
         }
 
         if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
-            std::vector<ggml_backend_dev_t> devs_extra;
-            uint32_t ngl_extra = 0;
-            uint32_t nct_extra = 0;
-            uint32_t nex_extra = 0;
-
-            extra->cparams->n_ctx = cparams->n_ctx;
-
             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
                 __func__, cparams->n_ctx);
 
-            dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                dmds_extra = common_get_extra_device_memory_data(extra, devs, cparams->n_ctx, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = cparams->n_ctx;
                 return;
-            }
-
-            dmds_extra = dmds_t(devs.size() + 1);
-            dmds_extra.back().mb = measured.back().mb;
-            for (size_t je = 0; je < devs_extra.size(); je++) {
-                for (size_t id = 0; id < devs.size(); id++) {
-                    if (devs_extra[je] == devs[id]) {
-                        dmds_extra[id].mb.model   += measured[je].mb.model;
-                        dmds_extra[id].mb.context += measured[je].mb.context;
-                        dmds_extra[id].mb.compute += measured[je].mb.compute;
-                        break;
-                    }
-                }
-            }
-            if (extra->shares_model) {
-                for (llama_device_memory_data & dmd : dmds_extra) {
-                    dmd.mb.model = 0;
-                }
             }
 
             n_ctx_extra = cparams->n_ctx;
@@ -1088,7 +1100,8 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 void common_fit_print(
         const char * path_model,
         llama_model_params * mparams,
-        llama_context_params * cparams) {
+        llama_context_params * cparams,
+        const common_fit_extra_model * extra) {
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
     uint32_t hp_nct = 0; // hparams.n_ctx_train
@@ -1096,6 +1109,15 @@ void common_fit_print(
 
     auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
+
+    if (extra != nullptr) {
+        const auto dmd_extra = common_get_extra_device_memory_data(extra, devs, cparams->n_ctx, GGML_LOG_LEVEL_ERROR);
+        for (size_t id = 0; id < dmd.size(); id++) {
+            dmd[id].mb.model   += dmd_extra[id].mb.model;
+            dmd[id].mb.context += dmd_extra[id].mb.context;
+            dmd[id].mb.compute += dmd_extra[id].mb.compute;
+        }
+    }
 
     for (size_t id = 0; id < devs.size(); id++) {
         printf("%s ",  ggml_backend_dev_name(devs[id]));

@@ -89,6 +89,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
     { LLM_ARCH_GLM_DSA,          "glm-dsa"          },
+    { LLM_ARCH_GLM5NEXT,         "glm5next"         },
     { LLM_ARCH_BITNET,           "bitnet"           },
     { LLM_ARCH_T5,               "t5"               },
     { LLM_ARCH_T5ENCODER,        "t5encoder"        },
@@ -157,6 +158,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MAINCODER,        "maincoder"        },
     { LLM_ARCH_MAION_CODER,      "maion-coder"      },
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
+    { LLM_ARCH_ZAYA,             "zaya"             },
     { LLM_ARCH_KIMI_K3,          "kimi-k3"          },
     { LLM_ARCH_GLM5_NEXT,        "glm5-next"        },
     { LLM_ARCH_TALKIE,           "talkie"           },
@@ -589,6 +591,18 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FFN_ROUTED_UP,                          "blk.%d.ffn_routed_up" },
     { LLM_TENSOR_FFN_ROUTED_NORM,                        "blk.%d.ffn_routed_norm" },
     { LLM_TENSOR_SSM_G_B,                                "blk.%d.ssm_g_b" },
+    { LLM_TENSOR_CCA_CONV_GRP,                           "blk.%d.cca_conv_grp" },
+    { LLM_TENSOR_CCA_K_SCALE,                            "blk.%d.cca_k_scale" },
+    { LLM_TENSOR_CCA_VAL_PROJ1,                          "blk.%d.cca_val_proj1" },
+    { LLM_TENSOR_CCA_VAL_PROJ2,                          "blk.%d.cca_val_proj2" },
+    { LLM_TENSOR_RES_SCALE_HS,                           "blk.%d.res_scale_hs" },
+    { LLM_TENSOR_RES_SCALE_RES,                          "blk.%d.res_scale_res" },
+    { LLM_TENSOR_RES_SCALE_HS_FINAL,                     "res_scale_hs" },
+    { LLM_TENSOR_RES_SCALE_RES_FINAL,                    "res_scale_res" },
+    { LLM_TENSOR_ZAYA_ROUTER_MLP2,                       "blk.%d.zaya_router_mlp2" },
+    { LLM_TENSOR_ZAYA_ROUTER_MLP4,                       "blk.%d.zaya_router_mlp4" },
+    { LLM_TENSOR_ZAYA_ROUTER_BIASES,                     "blk.%d.zaya_router_biases" },
+    { LLM_TENSOR_ZAYA_ROUTER_EDA_SCALE,                  "blk.%d.zaya_router_eda" },
     { LLM_TENSOR_SSM_NORM,                               "blk.%d.ssm_norm" },
     { LLM_TENSOR_ATTN_Q_A_NORM,                          "blk.%d.attn_q_a_norm" },
     { LLM_TENSOR_ATTN_KV_A_NORM,                         "blk.%d.attn_kv_a_norm" },
@@ -972,6 +986,18 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_ROUTED_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_ROUTED_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_SSM_G_B,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CCA_CONV_GRP,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_CCA_K_SCALE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_CCA_VAL_PROJ1,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CCA_VAL_PROJ2,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_RES_SCALE_HS,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_RES_SCALE_RES,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_RES_SCALE_HS_FINAL,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_RES_SCALE_RES_FINAL,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_ZAYA_ROUTER_MLP2,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ZAYA_ROUTER_MLP4,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ZAYA_ROUTER_BIASES,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_ZAYA_ROUTER_EDA_SCALE,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_TIME_MIX_LERP_X,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_TIME_MIX_LN,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_CHANNEL_MIX_LERP_K,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
@@ -1227,6 +1253,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_ZAYA:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
@@ -1234,6 +1261,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_MINIMAX_01:
             return true;
         default:
@@ -1260,6 +1288,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
@@ -1315,6 +1344,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_ZAYA:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:

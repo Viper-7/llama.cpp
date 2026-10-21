@@ -265,6 +265,28 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 123);
 
     {
+        common_params fit_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp", "--spec-draft-n-max", "7", "-ctkd", "f32", "-ctvd", "f32"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fit_params, LLAMA_EXAMPLE_FIT_PARAMS));
+        assert(fit_params.speculative.types == std::vector<enum common_speculative_type>({COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP}));
+        assert(fit_params.speculative.draft.n_max == 7);
+        assert(fit_params.speculative.draft.cache_type_k == GGML_TYPE_F32);
+        assert(fit_params.speculative.draft.cache_type_v == GGML_TYPE_F32);
+
+        const auto mparams = common_model_params_to_llama(fit_params);
+        const auto cparams = common_context_params_to_llama(fit_params);
+        const auto params_dft = common_base_params_to_speculative(fit_params);
+        auto cparams_dft = common_context_params_to_llama(params_dft);
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams_dft.n_rs_seq = 0;
+
+        assert(mparams.load_mtp);
+        assert(cparams.n_rs_seq == 7);
+        assert(cparams_dft.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
+        assert(cparams_dft.n_rs_seq == 0);
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
@@ -282,6 +304,20 @@ static void test(void) {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4x"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    {
+        common_params page_cache_params;
+        argv = {"binary_name", "--cache-page-ram", "4096", "--cache-page-tokens", "8192"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), page_cache_params, LLAMA_EXAMPLE_SERVER));
+        assert(page_cache_params.cache_page_ram_mib == 4096);
+        assert(page_cache_params.cache_page_tokens == 8192);
+
+        argv = {"binary_name", "--cache-page-ram", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), page_cache_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--cache-page-tokens", "0"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), page_cache_params, LLAMA_EXAMPLE_SERVER));
     }
 
     argv = {"binary_name", "-lm", "none"};

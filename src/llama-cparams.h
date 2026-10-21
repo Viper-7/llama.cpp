@@ -16,6 +16,7 @@ struct llama_cparams {
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
+    uint32_t glm5next_sparse_query_chunk; // maximum queries per compact DSA attention chunk, 0 disables
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
@@ -53,6 +54,9 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool moe_route_stats;     // collect bounded aggregate GLM5Next expert routing telemetry
+    bool glm5next_turbo3_mla; // experimental signed-WHT Turbo3 main DSA cache
+    bool glm5next_sparse_query_scatter; // preallocated in-place assembly for chunked GLM5Next DSA output
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;

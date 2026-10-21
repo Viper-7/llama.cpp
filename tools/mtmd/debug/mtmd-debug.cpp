@@ -11,6 +11,7 @@
 
 #include <vector>
 #include <cmath>
+#include <fstream>
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
@@ -91,8 +92,18 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
-        {
-            // always enable debug callback
+        if (std::getenv("MTMD_DEBUG_TRACE_NODES") != nullptr) {
+            mparams.cb_eval = [](ggml_tensor * tensor, bool ask, void *) {
+                if (ask) {
+                    LOG_INF("trace node: %s op=%s type=%s ne=[%lld,%lld,%lld,%lld]\n",
+                            tensor->name, ggml_op_desc(tensor), ggml_type_name(tensor->type),
+                            (long long) tensor->ne[0], (long long) tensor->ne[1],
+                            (long long) tensor->ne[2], (long long) tensor->ne[3]);
+                }
+                return false;
+            };
+        } else if (std::getenv("MTMD_DEBUG_DISABLE_CALLBACK") == nullptr) {
+            // Enable per-node tensor dumps unless a large graph only needs its final output.
             mparams.cb_eval_user_data = &cb_data;
             mparams.cb_eval = common_debug_cb_eval;
         }
@@ -237,7 +248,17 @@ int main(int argc, char ** argv) {
         std::vector<uint8_t> rgb_values;
         std::vector<float> pcm_samples;
 
-        if (input == "black") {
+        if (const char * pcm_path = std::getenv("MTMD_DEBUG_PCM_FILE")) {
+            std::ifstream pcm_file(pcm_path, std::ios::binary | std::ios::ate);
+            const std::streamsize n_bytes = pcm_file.tellg();
+            if (!pcm_file || n_bytes <= 0 || n_bytes % sizeof(float) != 0) {
+                LOG_ERR("ERR: Invalid raw F32 PCM file: %s\n", pcm_path);
+                return 1;
+            }
+            pcm_samples.resize(n_bytes / sizeof(float));
+            pcm_file.seekg(0);
+            pcm_file.read(reinterpret_cast<char *>(pcm_samples.data()), n_bytes);
+        } else if (input == "black") {
             rgb_values = std::vector<uint8_t>(inp_size * inp_size * 3, 0);
         } else if (input == "white") {
             rgb_values = std::vector<uint8_t>(inp_size * inp_size * 3, 255);
@@ -291,4 +312,3 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
-

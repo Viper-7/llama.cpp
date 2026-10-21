@@ -287,6 +287,17 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// Turbo3 runtime KV cache: one 128-value WHT group per block. The 3-bit
+// centroid index is split into two low bits and one high bit.
+#define QK_TURBO3 128
+typedef struct {
+    ggml_half norm;
+    uint8_t qs[QK_TURBO3 / 4];
+    uint8_t signs[QK_TURBO3 / 8];
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3 / 4 + QK_TURBO3 / 8,
+        "wrong turbo3_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

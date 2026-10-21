@@ -2935,6 +2935,8 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .event_new            = */ ggml_backend_rpc_device_event_new,
     /* .event_free           = */ ggml_backend_rpc_device_event_free,
     /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
+    /* .event_new_timing     = */ NULL,
+    /* .event_elapsed_time   = */ NULL,
 };
 
 // backend reg interface

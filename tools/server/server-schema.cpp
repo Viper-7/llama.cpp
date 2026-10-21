@@ -28,6 +28,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ->set_desc("Whether to include usage information in the stream"))
         ->set_desc("Additional options for streaming responses"));
 
+    add((new field_bool("prefill_only", params.prefill_only))
+        ->set_desc("Evaluate the prompt and finish without sampling output tokens"));
+
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 
@@ -464,6 +467,54 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     return fields;
 }
 
+server_cache_control parse_cache_control(const json & value) {
+    if (!value.is_object()) {
+        throw std::invalid_argument("cache_control must be an object");
+    }
+
+    server_cache_control result;
+    for (const auto & item : value.items()) {
+        if (item.key() == "priority") {
+            if (!item.value().is_string()) {
+                throw std::invalid_argument("cache_control.priority must be interactive or background");
+            }
+            const auto priority = item.value().get<std::string>();
+            if (priority == "interactive") {
+                result.priority = server_cache_priority::interactive;
+            } else if (priority != "background") {
+                throw std::invalid_argument("cache_control.priority must be interactive or background");
+            }
+        } else if (item.key() == "lifecycle") {
+            if (!item.value().is_string()) {
+                throw std::invalid_argument("cache_control.lifecycle must be retained, ephemeral, or one_shot");
+            }
+            const auto lifecycle = item.value().get<std::string>();
+            if (lifecycle == "ephemeral") {
+                result.lifecycle = server_cache_lifecycle::ephemeral;
+            } else if (lifecycle == "one_shot") {
+                result.lifecycle = server_cache_lifecycle::one_shot;
+            } else if (lifecycle != "retained") {
+                throw std::invalid_argument("cache_control.lifecycle must be retained, ephemeral, or one_shot");
+            }
+        } else if (item.key() == "branch") {
+            if (!item.value().is_string()) {
+                throw std::invalid_argument("cache_control.branch must be a nonempty string of at most 128 characters");
+            }
+            result.branch = item.value().get<std::string>();
+            if (result.branch.empty() || result.branch.size() > 128 ||
+                    result.branch.find_first_not_of(" \t\r\n") == std::string::npos) {
+                throw std::invalid_argument("cache_control.branch must be a nonempty string of at most 128 characters");
+            }
+        } else {
+            throw std::invalid_argument("unknown cache_control field: " + item.key());
+        }
+    }
+    if (result.lifecycle == server_cache_lifecycle::one_shot && !result.branch.empty()) {
+        throw std::invalid_argument("cache_control.branch is not allowed with one_shot lifecycle");
+    }
+    return result;
+}
+
 task_params eval_llama_cmpl_schema(
                 const llama_vocab * vocab,
                 const common_params & params_base,
@@ -496,6 +547,9 @@ task_params eval_llama_cmpl_schema(
     // eval all fields in the schema
     for (const auto & f : schema) {
         f->eval(ctx, data);
+    }
+    if (data.contains("cache_control")) {
+        params.cache_control = parse_cache_control(data.at("cache_control"));
     }
 
     // debugging

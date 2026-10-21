@@ -126,6 +126,9 @@ if (CUDAToolkit_FOUND)
 
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    list(APPEND GGML_SOURCES_CUDA
+        ${CMAKE_CURRENT_SOURCE_DIR}/template-instances/fattn-vec-instance-f32-f32.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu)
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
@@ -138,6 +141,10 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+    endif()
+
+    if (GGML_CUDA_TEST_MMQ_FORCE_J)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TEST_MMQ_FORCE_J)
     endif()
 
     if (GGML_CUDA_FORCE_CUBLAS)

@@ -124,10 +124,12 @@ extern "C" {
     //
 
     GGML_API ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device);
+    GGML_API ggml_backend_event_t ggml_backend_event_new_timing(ggml_backend_dev_t device);
     GGML_API void                 ggml_backend_event_free(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
+    GGML_API bool                 ggml_backend_event_elapsed_time(ggml_backend_event_t start, ggml_backend_event_t end, float * elapsed_ms);
 
     //
     // Backend device

@@ -186,6 +186,23 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+#ifdef GGML_CUDA_TEST_MMQ_FORCE_J
+    int forced_J = 0;
+    bool type_allowed = true;
+    if (const char * filter = std::getenv("GGML_CUDA_TEST_MMQ_FORCE_IQ3_IQ4_ONLY")) {
+        GGML_ASSERT(std::strcmp(filter, "1") == 0);
+        type_allowed = src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ4_XS;
+    }
+    if (ids && type_allowed) {
+        if (const char * value = std::getenv("GGML_CUDA_TEST_MMQ_FORCE_J")) {
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            GGML_ASSERT(cc == GGML_CUDA_CC_VEGA20 && end != value && *end == 0 &&
+                (parsed == 8 || parsed == 16 || parsed == 24 || parsed == 32 || parsed == 64));
+            forced_J = int(parsed);
+        }
+    }
+#endif
     int J_best        = 0;
     int nthreads_best = 0;
     {
@@ -204,6 +221,9 @@ void ggml_cuda_mul_mat_q(
         int ntiles_J_best = INT_MAX;
 
         for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+#ifdef GGML_CUDA_TEST_MMQ_FORCE_J
+            if (forced_J && J != forced_J) continue;
+#endif
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
             if (config.type == GGML_TYPE_COUNT) {
                 continue;
@@ -223,6 +243,9 @@ void ggml_cuda_mul_mat_q(
         }
     }
     GGML_ASSERT(J_best > 0);
+#ifdef GGML_CUDA_TEST_MMQ_FORCE_J
+    GGML_ASSERT(!forced_J || J_best == forced_J);
+#endif
 
     // A tile of size J can read in at most J - 1 extra columns.
     // For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.

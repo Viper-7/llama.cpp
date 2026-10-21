@@ -431,6 +431,12 @@ typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor *
 
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K_in, const ggml_type type_V_in) {
+    if (head_size == 512 && type_K_in == GGML_TYPE_F32 && type_V_in == GGML_TYPE_F32) {
+        return ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_F32, GGML_TYPE_F32>;
+    }
+    if (head_size == 512 && type_K_in == GGML_TYPE_TURBO3_0 && type_V_in == GGML_TYPE_TURBO3_0) {
+        return ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>;
+    }
     const ggml_type type_K = type_K_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K_in;
     const ggml_type type_V = type_V_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V_in;
     FATTN_VEC_CASES_ALL_D(F16,  F16)
@@ -525,6 +531,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
@@ -554,6 +561,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -631,7 +640,26 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // This fork also instantiates the gfx906-tuned D=512 F16/F16 vector kernel.
+    const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // Turbo3 is intentionally limited to the D=512 K/V oracle below. The
+    // integration does not instantiate a tile or MMA Turbo3 path.
+    if (K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0) {
+        if (cc == GGML_CUDA_CC_VEGA20 && can_use_vector_kernel && Q->ne[0] == 512 && Q->ne[3] == 1 &&
+                logit_softcap == 0.0f &&
+                K->type == GGML_TYPE_TURBO3_0 && V->type == GGML_TYPE_TURBO3_0) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // gfx906 has no MFMA/WMMA route in this selector. Its D=512 vector
+    // specialization is the correctness-preserving decode path for GLM MLA.
+    if (cc == GGML_CUDA_CC_VEGA20 && can_use_vector_kernel && Q->ne[0] == 512 && Q->ne[1] == 1 && Q->ne[3] == 1 &&
+            K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -701,6 +729,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // A batch of independent GLM compact windows has one query per sequence.
+    // The D=512 vector kernel serializes those windows; the tile kernel exposes
+    // their sequence/head parallelism and still scans only P rows per query.
+    if (cc == GGML_CUDA_CC_VEGA20 && can_use_vector_kernel && Q->ne[0] == 512 && Q->ne[1] == 1 && Q->ne[3] > 1 &&
+            K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
@@ -741,8 +777,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
-            need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
-            need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
+            need_f16_K = (K->type == GGML_TYPE_F32 && Q->ne[0] != 512) || f16_fallback;
+            need_f16_V = (V->type == GGML_TYPE_F32 && Q->ne[0] != 512) || f16_fallback;
         } break;
         case BEST_FATTN_KERNEL_NONE:
             break;

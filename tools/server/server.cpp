@@ -254,6 +254,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         routes.post_infill                 = models_routes->proxy_post;
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
+        routes.post_hidden_states          = models_routes->proxy_post;
+        routes.post_cache_probe            = models_routes->proxy_post;
+        routes.post_cache_release          = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
         routes.post_systemone              = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
@@ -290,6 +293,10 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
+    ctx_http.get("/v1/internal/responses/capabilities", ex_wrapper(routes.get_responses_capabilities));
+    ctx_http.post("/v1/internal/responses/cancel", ex_wrapper(routes.post_responses_cancel));
+    ctx_http.post("/v1/internal/responses/suspend", ex_wrapper(routes.post_responses_suspend));
+    ctx_http.post("/v1/internal/responses/context", ex_wrapper(routes.post_responses_context));
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
@@ -301,6 +308,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
     ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));
     ctx_http.post("/v1/embeddings",            ex_wrapper(routes.post_embeddings_oai));
+    ctx_http.post("/v1/internal/hidden-states", ex_wrapper(routes.post_hidden_states));
+    ctx_http.post("/v1/internal/cache-probe",   ex_wrapper(routes.post_cache_probe));
+    ctx_http.post("/v1/internal/cache/release", ex_wrapper(routes.post_cache_release));
     ctx_http.post("/rerank",                   ex_wrapper(routes.post_rerank));
     ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));

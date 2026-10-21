@@ -4,6 +4,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <algorithm>
+
 //
 // llama_memory_hybrid
 //
@@ -29,8 +31,12 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+    const layer_filter_cb & filter_idx,
+                ggml_type   type_idx,
+       ggml_backend_dev_t   attn_dev_override) :
     hparams(model.hparams),
+    hparams_idx(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
         model.hparams,
@@ -49,7 +55,9 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        attn_dev_override
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -62,7 +70,28 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )),
+    mem_idx(filter_idx == nullptr ? nullptr : [&] {
+        // a *pooling* indexer (indexer_kpool > 0, glm5next only) needs a second head for
+        // the compressor gate, or the pool cannot be rebuilt once its tokens leave the
+        // batch. every other arch leaves indexer_kpool 0 and is unchanged.
+        //
+        // the third head is the pooled key of the pool this cell ENDS, i.e. it is written
+        // only for cells at pos % kpool == kpool-1. caching it turns the per-step pooling
+        // from O(n_kv) into O(pools completed by this ubatch): see build_indexer.
+        const uint32_t n_head_idx = model.hparams.indexer_kpool > 0 ? 3 : 1;
+
+        std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), n_head_idx);
+        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, %u x %u per cell, type = %s\n",
+                __func__, kv_size, n_head_idx, hparams_idx.n_embd_head_k_full, ggml_type_name(type_idx));
+
+        return new llama_kv_cache(
+            model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
+            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            nullptr, filter_idx, nullptr, nullptr, "", attn_dev_override);
+    }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -115,8 +144,16 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
+        // the indexer takes the attention cache's slot layout rather than finding its
+        // own: allocated separately the two drift apart when the context is rewritten
+        // between turns, and the top-k indices would then point at the wrong cells
+        llama_kv_cache::slot_info_vec_t heads_idx;
+        if (mem_idx) {
+            heads_idx = heads_attn;
+        }
+
         return std::make_unique<llama_memory_hybrid_context>(
-                this, std::move(heads_attn), std::move(ubatches));
+                this, std::move(heads_attn), std::move(ubatches), std::move(heads_idx));
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -126,17 +163,25 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
     return std::make_unique<llama_memory_hybrid_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_context>(this, n_kv);
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
 
 bool llama_memory_hybrid::get_can_shift() const {
     // Shifting is trivially supported for recurrent
+    if (mem_idx && !mem_idx->get_can_shift()) {
+        return false;
+    }
     return mem_attn->get_can_shift();
 }
 
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
+    if (mem_idx) mem_idx->clear(data);
     mem_recr->clear(data);
 }
 
@@ -146,26 +191,55 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+    if (mem_idx) mem_idx->seq_rm(seq_id, p0, p1);
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    if (mem_idx) mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
+    if (mem_idx) mem_idx->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    // pools group cells by absolute position, so a shift regroups them; every pooled key
+    // cached in the indexer rows is then stale even though each pool still looks complete.
+    // it survives only if WHOLE pools move: the shift must be a multiple of kpool and the
+    // range must start and end on a pool boundary. a pool straddling p0 or p1 keeps some
+    // members and moves the rest, which regroups it however aligned the shift itself is,
+    // and both callers pass an arbitrary bound -- the server's context shift uses
+    // n_keep + n_discard, its prompt-cache reuse uses the match head.
+    if (mem_idx && hparams.indexer_kpool > 0) {
+        const llama_pos r = (llama_pos) hparams.indexer_kpool;
+
+        // p0 < 0 means "from the start" and p1 < 0 means "to the end", so neither is a
+        // boundary a pool can straddle
+        const bool whole_pools = shift % r == 0 &&
+                                 (p0 <= 0 || p0 % r == 0) &&
+                                 (p1 <  0 || p1 % r == 0);
+
+        if (!whole_pools) {
+            mem_attn->set_kpool_dirty();
+        }
+    }
     mem_attn->seq_add(seq_id, p0, p1, shift);
+    if (mem_idx) mem_idx->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    // as seq_add, and a divide regroups for any d != 1
+    if (mem_idx && hparams.indexer_kpool > 0 && d != 1) {
+        mem_attn->set_kpool_dirty();
+    }
     mem_attn->seq_div(seq_id, p0, p1, d);
+    if (mem_idx) mem_idx->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
 
@@ -184,22 +258,57 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
+    if (mem_idx) {
+        for (const auto & buft_size : mem_idx->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
     return mb;
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    mem_attn->state_write(io, seq_id, flags);
+    state_write_range(io, seq_id, flags, -1, -1);
+}
+
+void llama_memory_hybrid::state_write_range(
+        llama_io_write_i & io,
+           llama_seq_id   seq_id,
+  llama_state_seq_flags   flags,
+             llama_pos   p0,
+             llama_pos   p1) const {
+    if (p0 >= 0 && seq_id < 0) {
+        throw std::runtime_error("position-range hybrid state export requires one sequence");
+    }
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && p1 >= 0 && p1 != seq_pos_max(seq_id) + 1) {
+        throw std::runtime_error("hybrid state range must end at the current sequence tail");
+    }
+
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        mem_attn->state_write_range(io, seq_id, flags, p0, p1);
+        // indexer keys are not recomputable; skipping them here misselects on restore
+        if (mem_idx) mem_idx->state_write_range(io, seq_id, flags, p0, p1);
+    }
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    mem_attn->state_read(io, seq_id, flags);
-
     try {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            mem_attn->state_read(io, seq_id, flags);
+            if (mem_idx) mem_idx->state_read(io, seq_id, flags);
+        }
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
-        // a failed restore leaves the sequence empty in both caches
-        mem_attn->state_clear(seq_id);
+        // A component can fail after mutating its cells (for example when the
+        // serialized KV type does not match). Do not leave the hybrid caches at
+        // different sequence states after a failed restore.
+        if (seq_id < 0) {
+            clear(true);
+        } else {
+            mem_attn->seq_rm(seq_id, -1, -1);
+            mem_recr->seq_rm(seq_id, -1, -1);
+            if (mem_idx) mem_idx->seq_rm(seq_id, -1, -1);
+        }
 
         throw;
     }
@@ -213,11 +322,23 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }
 
+llama_kv_cache * llama_memory_hybrid::get_mem_idx() const {
+    return mem_idx.get();
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
+    llama_memory_hybrid_context(mem, mem->get_mem_attn()->get_size()) {
+}
+
+llama_memory_hybrid_context::llama_memory_hybrid_context(
+        llama_memory_hybrid * mem,
+        uint32_t n_kv) :
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), n_kv)),
     ctx_recr(mem->get_mem_recr()->init_full()),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), n_kv)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
@@ -227,17 +348,25 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
                        bool   optimize) :
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
+    // indexer keys carry no positional encoding, but the pending per-cell delta must
+    // still be cleared or the two caches disagree about whether a shift is outstanding.
+    // safe because an indexer only exists for LLAMA_ROPE_TYPE_NONE archs, where
+    // llama_kv_cache::update skips the K-shift graph and does only that
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr : mem->get_mem_idx()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches) :
+        std::vector<llama_ubatch>   ubatches,
+                  slot_info_vec_t   sinfos_idx) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
@@ -246,6 +375,7 @@ bool llama_memory_hybrid_context::next() {
 
     ctx_attn->next();
     ctx_recr->next();
+    if (ctx_idx) ctx_idx->next();
 
     if (++i_next >= ubatches.size()) {
         return false;
@@ -261,6 +391,17 @@ bool llama_memory_hybrid_context::apply() {
 
     res = res & ctx_attn->apply();
     res = res & ctx_recr->apply();
+
+    if (ctx_idx) {
+        res = res & ctx_idx->apply();
+
+        // a top-k over indexer cells is meaningful only if both caches cover the same
+        // window
+        if (!ubatches.empty()) {
+            GGML_ASSERT(get_idx()->get_n_kv()     == get_attn()->get_n_kv());
+            GGML_ASSERT(get_idx()->get_n_stream() == get_attn()->get_n_stream());
+        }
+    }
 
     return res;
 }
@@ -280,4 +421,8 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+const llama_kv_cache_context * llama_memory_hybrid_context::get_idx() const {
+    return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
 }

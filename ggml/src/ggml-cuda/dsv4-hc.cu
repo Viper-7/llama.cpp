@@ -4,6 +4,20 @@
 
 static constexpr int DSV4_HC = 4;
 
+#if defined(GGML_USE_HIP)
+static __device__ __forceinline__ float dsv4_fmul_rn(float x, float y) {
+    float result;
+    asm volatile("v_mul_f32 %0, %1, %2" : "=v"(result) : "v"(x), "v"(y));
+    return result;
+}
+
+static __device__ __forceinline__ float dsv4_fadd_rn(float x, float y) {
+    float result;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(x), "v"(y));
+    return result;
+}
+#endif
+
 
 static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
     for (int idst = 0; idst < DSV4_HC; ++idst) {
@@ -116,7 +130,7 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float scale, bool precise) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -139,11 +153,46 @@ static __global__ void dsv4_hc_pre_f32(
         } else {
             wv = weights[ih*sw0 + it*sw1];
         }
+#if defined(GGML_USE_HIP)
+        if (precise) {
+            const float term = dsv4_fmul_rn(xv, wv);
+            sum = ih == 0 ? term : dsv4_fadd_rn(sum, term);
+            continue;
+        }
+#else
+        (void) precise;
+#endif
         sum += xv * wv;
     }
 
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
+
+#if defined(GGML_USE_HIP)
+template<int block_size>
+static __global__ __launch_bounds__(block_size, 1) void dsv4_hc_pre_moe_top8_4096_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ weights,
+        float * __restrict__ dst) {
+    const int64_t i0 = (int64_t) blockIdx.x * block_size + threadIdx.x;
+    const int64_t it = blockIdx.y;
+    const float * x_token = x + it * 8 * 4096 + i0;
+
+    const int lane = threadIdx.x & 63;
+    float w = lane == 0 ? weights[it * 8] : 0.0f;
+    w = __shfl_sync(0xFFFFFFFF, w, 0, 64);
+    float sum = dsv4_fmul_rn(x_token[0], w);
+
+#pragma unroll
+    for (int ih = 1; ih < 8; ++ih) {
+        w = lane == 0 ? weights[it * 8 + ih] : 0.0f;
+        w = __shfl_sync(0xFFFFFFFF, w, 0, 64);
+        sum = dsv4_fadd_rn(sum, dsv4_fmul_rn(x_token[ih * 4096], w));
+    }
+
+    dst[it * 4096 + i0] = sum;
+}
+#endif
 
 // gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
 template <bool has_comb, bool gated>
@@ -260,6 +309,35 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int64_t n_embd   = x->ne[0];
     const int64_t hc       = x->ne[1];
     const int64_t n_tokens = x->ne[2];
+    const bool precise     = ggml_get_op_params_i32(dst, 2) != 0;
+
+#if defined(GGML_USE_HIP)
+    const char * force_generic = std::getenv("GGML_CUDA_DSV4_HC_PRE_GENERIC");
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    // GLM5Next feeds four mHC streams per logical token, so depth-5 MTP target
+    // verification reaches 24 physical rows. One wave minimizes q1 latency;
+    // four waves reduce block scheduling once there is enough parallel work.
+    if (precise && !(force_generic != nullptr && strcmp(force_generic, "0") != 0) &&
+            cc == GGML_CUDA_CC_VEGA20 && n_embd == 4096 && hc == 8 && n_tokens >= 1 && n_tokens <= 24 &&
+            x->ne[3] == 1 && ggml_is_contiguous(x) && ggml_is_contiguous(weights) && ggml_is_contiguous(dst)) {
+        if (n_tokens <= 6) {
+            const dim3 block_dims(64, 1, 1);
+            const dim3 grid_dims(64, n_tokens, 1);
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+            ggml_cuda_kernel_launch(dsv4_hc_pre_moe_top8_4096_f32<64>, launch_params,
+                    (const float *) x->data, (const float *) weights->data, (float *) dst->data);
+        } else {
+            const dim3 block_dims(256, 1, 1);
+            const dim3 grid_dims(16, n_tokens, 1);
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+            ggml_cuda_kernel_launch(dsv4_hc_pre_moe_top8_4096_f32<256>, launch_params,
+                    (const float *) x->data, (const float *) weights->data, (float *) dst->data);
+        }
+        return;
+    }
+#endif
 
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
@@ -277,7 +355,7 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, precise);
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,

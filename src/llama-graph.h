@@ -37,6 +37,9 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+// defined in llama-kv-cache-kpool.h, which includes this header, so forward declared only
+class llm_graph_input_kpool;
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
@@ -44,6 +47,11 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
 };
+
+// Internal sentinel keys used by specialized hidden-state consumers. Decoder
+// layer outputs continue to use their non-negative layer indexes.
+constexpr int32_t LLAMA_HIDDEN_STATE_KEY_FINAL_NORM   = -2;
+constexpr int32_t LLAMA_HIDDEN_STATE_KEY_SCALED_INPUT = -1;
 
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
@@ -115,6 +123,12 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // Native MTP can supply its hidden-state leaf from a backend-owned carry
+    // tensor. Other graph inputs retain their ordinary host setters.
+    virtual void set_input_no_hidden(const llama_ubatch * ubatch) {
+        set_input(ubatch);
+    }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -158,6 +172,7 @@ public:
     virtual ~llm_graph_input_embd_h() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void set_input_no_hidden(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -811,6 +826,7 @@ struct llm_graph_params {
     const llama_hadamard * hdmd = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::set<int32_t> hidden_state_layers;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -901,11 +917,17 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.warmup                  == other.cparams.warmup                  &&
+            cparams.moe_route_stats         == other.cparams.moe_route_stats         &&
+            cparams.glm5next_turbo3_mla     == other.cparams.glm5next_turbo3_mla     &&
+            cparams.glm5next_sparse_query_scatter == other.cparams.glm5next_sparse_query_scatter &&
+            cparams.glm5next_sparse_query_chunk == other.cparams.glm5next_sparse_query_chunk &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            hidden_state_layers == other.hidden_state_layers;
     }
 };
 
@@ -926,6 +948,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_inp_h()       const { return t_inp_h; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -936,7 +959,7 @@ public:
 
     void reset();
 
-    void set_inputs(const llama_ubatch * ubatch);
+    void set_inputs(const llama_ubatch * ubatch, bool skip_hidden = false);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -965,6 +988,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_inp_h       = nullptr; // [n_embd, n_tokens] native MTP hidden-state input
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -972,6 +996,8 @@ public:
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
+    std::map<int32_t, ggml_tensor *> t_hidden_states;
+    std::map<int32_t, ggml_tensor *> t_moe_routes;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1069,6 +1095,7 @@ struct llm_graph_context {
     const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    const std::set<int32_t> hidden_state_layers;
 
     const llm_graph_cb & cb_func;
 
@@ -1264,7 +1291,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                   bool   turbo3_rotated_basis) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1435,6 +1463,35 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    // one pooling map per ubatch (see llama-kv-cache-kpool.h); `scoring` false gives only k_idxs
+    llm_graph_input_kpool * build_inp_kpool(
+            const llama_memory_hybrid_context * mctx_cur,
+            ggml_tensor * kq_mask,
+            bool scoring) const;
+
+    // build_attn, but masking with `top_k` over `sel_mask`; `cand_mask` drops over-budget picks
+    ggml_tensor * build_attn_sparse(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,     // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,     // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,     // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,     // [n_head_q]
+            ggml_tensor * v_mla,     // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+            ggml_tensor * top_k,     // I32 [n_select, n_tokens/n_stream, n_stream]
+            ggml_tensor * pool_sel,  // I32 [select_k, n_tokens/n_stream, n_stream]
+            ggml_tensor * pool_bias, // F32 [n_pools, n_tokens/n_stream, n_stream]
+            ggml_tensor * sel_mask,  // F16/F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * cand_mask, // F16/F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * tail_pad_cells,
+            ggml_tensor * tail_pad_valid,
+            ggml_tensor * segment_rows,
+                  float   kq_scale,
+                    int   il) const;
 
     //
     // pooling

@@ -1308,8 +1308,10 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_graph_context {
-        graph(const llm_graph_params & params) : llm_graph_context(params) {}
+    // method-only mixin; here only so glm5next, deriving from this graph, reaches
+    // build_delta_net. deepseek4 itself has no recurrent layers
+    struct graph : public llm_build_delta_net_base {
+        graph(const llm_graph_params & params) : llm_build_delta_net_base(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
 
         // collapse the hc streams with per-stream weights
@@ -1466,6 +1468,66 @@ struct llama_model_glm_dsa : public llama_model_base {
     };
 
     struct graph_mtp : public llm_graph_context {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_glm5next : public llama_model_base {
+    llama_model_glm5next(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // glm5next's mHC is DeepSeek-V4's block, collapsed by unweighted mean, not a gated head
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        // builds nothing: lets graph_mtp reuse the block helpers below without the trunk
+        graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
+
+        // not const: the delta-net helpers append to the graph through the base
+        ggml_tensor * build_layer_attn(
+                const llama_model & model,
+                llm_graph_input_mem_hybrid_k * inp_mem,
+                llm_graph_input_kpool * inp_kp,
+                bool scoring,
+                ggml_tensor * cur,
+                int il);
+
+        ggml_tensor * build_kda_layer(
+                const llama_layer & layer,
+                llm_graph_input_rs * inp_rs,
+                ggml_tensor * cur,
+                int il);
+
+        // `scoring` false keeps the dense path, the same function below n_select
+        ggml_tensor * build_dsa_layer(
+                const llama_layer & layer,
+                llm_graph_input_attn_k * inp_attn,
+                llm_graph_input_kpool * inp_kp,
+                bool scoring,
+                ggml_tensor * cur,
+                int il) const;
+
+        // always stores the key and gate; when `scoring`, returns the selected CELL indices
+        ggml_tensor * build_indexer(
+                const llama_layer & layer,
+                llm_graph_input_kpool * inp_kp,
+                ggml_tensor * cur,
+                ggml_tensor * qr,
+                ggml_tensor ** pool_sel,
+                bool scoring,
+                int il) const;
+
+        ggml_tensor * build_layer_ffn(
+                const llama_model & model,
+                ggml_tensor * cur,
+                int il) const;
+    };
+
+    // NextN draft head. reuses the trunk's block helpers, so it stays a `graph`
+    struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
@@ -2968,6 +3030,18 @@ struct llama_model_step35 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llm_build_zaya : public llm_graph_context {
+    llm_build_zaya(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llama_model_zaya : public llama_model_base {
+    llama_model_zaya(const struct llama_model_params & params) : llama_model_base(params) {}
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
 
 struct llama_model_spark2_5 : public llama_model_base {
     llama_model_spark2_5(const struct llama_model_params & params) : llama_model_base(params) {}

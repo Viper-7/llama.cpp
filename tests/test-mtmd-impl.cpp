@@ -192,16 +192,17 @@ MAKE_TEST(test_temporal_merge_grouping) {
     // { parts, n_merge, expected size of each group }
     const std::vector<std::tuple<std::string, int, std::string>> cases = {
         { "vv",   2, "2"    },
-        { "vvv",  2, "21"   },
+        { "v",    2, "2"    }, // final video frame is repeated to complete a temporal pair
+        { "vvv",  2, "22"   },
         { "vvvv", 2, "22"   },
         { "vvi",  2, "21"   },
         { "tvvt", 2, "2"    },
-        { "vtv",  2, "11"   }, // text in between breaks the merge
-        { "vw",   2, "11"   }, // different sizes cannot be merged
+        { "vtv",  2, "22"   }, // text in between breaks the merge; each tail is padded
+        { "vw",   2, "22"   }, // different sizes cannot merge; each tail is padded independently
         { "aa",   2, "11"   }, // audio is never merged
         { "ii",   2, "11"   }, // two unrelated images must stay separated
-        { "iv",   2, "11"   },
-        { "vi",   2, "11"   },
+        { "iv",   2, "12"   },
+        { "vi",   2, "21"   },
         { "vv",   1, "11"   }, // model without temporal merge
     };
 

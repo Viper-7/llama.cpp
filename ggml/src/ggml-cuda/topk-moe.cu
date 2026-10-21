@@ -115,7 +115,11 @@ __device__ void group_mask_warp_inplace(float (&vals)[experts_per_thread], const
         const float other = __shfl_sync(0xFFFFFFFF, score, g, WARP_SIZE);
         rank += other > score || (other == score && g < lane);
     }
+#if defined(GGML_USE_HIP)
+    const auto keep = __ballot(lane < n_groups && rank < n_group_used);
+#else
     const auto keep = __ballot_sync(0xFFFFFFFFULL, lane < n_groups && rank < n_group_used);
+#endif
 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {

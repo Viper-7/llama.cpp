@@ -640,6 +640,8 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_page_ram_mib  = 0;     // process-local range-state page cache; 0 = disabled
+    int32_t cache_page_tokens   = 8192;  // tokens per range-state page
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
     // llama-connect params
@@ -665,6 +667,8 @@ struct common_params {
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
+    // [AI] URL to an external vision tower service for image/video embeddings (llama-server only).
+    std::string visiontower_url = ""; // NOLINT
 
     std::vector<std::string> api_keys;
 

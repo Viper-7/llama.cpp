@@ -100,6 +100,93 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
+// This remains separate from quantize_q8_1 so the normal Q8 path does not pay
+// for the LDS, barriers, or sort temporaries. The caller restricts it to the
+// contiguous GLM IQ4_XS down-projection shape (K=2048, top-8, q=6).
+template <int c_ncols_dst>
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_q8_1_iq4_xs_sorted_moe(
+        const float * x_ptr, const int32_t * ids, void * vy_ptr, uint8_t * sorted_assignments, const uint32_t ids_stride,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+    constexpr int n_expert_used = 8;
+    constexpr int assignments   = c_ncols_dst*n_expert_used;
+
+    __shared__ uint32_t keys[64];
+
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    // The dispatch requires ne0 == 2048, a multiple of this block size, so no
+    // threads exit before the optional full-workgroup sort barriers below.
+
+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
+    const int64_t i2 = blockIdx.z - i3*ne2.z;
+    const int64_t i1 = blockIdx.y;
+
+    const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+    const int64_t ib  = i_cont / QK8_1;
+    const int64_t iqs = i_cont % QK8_1;
+
+    ggml_cuda_pdl_sync();
+    const float xi = i0 < ne00 ? x[i3*s03 + i2*s02 + i1*s01 + i0] : 0.0f;
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+
+    // ids are produced by earlier stream work. This workgroup alone writes the
+    // permutation; the next MMVQ launch observes it only after this whole
+    // quantization launch completes. Every one of the 256 threads participates
+    // in barriers, while just the first 64 operate on the padded bitonic list.
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+        const uint32_t lane = threadIdx.x;
+        if (lane < 64) {
+            if (lane < assignments) {
+                const uint32_t token = lane / n_expert_used;
+                const uint32_t rank  = lane % n_expert_used;
+                keys[lane] = (static_cast<uint32_t>(ids[token*ids_stride + rank]) << 6) | lane;
+            } else {
+                keys[lane] = UINT32_MAX;
+            }
+        }
+        __syncthreads();
+
+        for (uint32_t width = 2; width <= 64; width <<= 1) {
+            for (uint32_t stride = width >> 1; stride != 0; stride >>= 1) {
+                if (lane < 64) {
+                    const uint32_t partner = lane ^ stride;
+                    if (partner > lane) {
+                        const uint32_t a = keys[lane];
+                        const uint32_t b = keys[partner];
+                        const bool ascending = (lane & width) == 0;
+                        keys[lane]    = ascending ? min(a, b) : max(a, b);
+                        keys[partner] = ascending ? max(a, b) : min(a, b);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        if (lane < assignments) {
+            sorted_assignments[lane] = keys[lane] & 63;
+        }
+    }
+}
+
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
         return 0;
@@ -568,6 +655,27 @@ void quantize_row_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
     ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    GGML_UNUSED(type_src0);
+}
+
+void quantize_row_q8_1_iq4_xs_sorted_moe_cuda(
+        const float * x, const int32_t * ids, void * vy, uint8_t * sorted_assignments, const uint32_t ids_stride,
+        ggml_type type_src0, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne0 == 2048);
+    GGML_ASSERT(ne0 % QK8_1 == 0);
+    GGML_ASSERT(ne1 == 8);
+    GGML_ASSERT(ne2 == 6);
+    GGML_ASSERT(ne3 == 1);
+
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+    const dim3 num_blocks(ne0 / CUDA_QUANTIZE_BLOCK_SIZE, ne1, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+
+    ggml_cuda_kernel_launch(quantize_q8_1_iq4_xs_sorted_moe<6>, launch_params,
+        x, ids, vy, sorted_assignments, ids_stride, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+
     GGML_UNUSED(type_src0);
 }
 

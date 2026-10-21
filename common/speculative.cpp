@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1450,11 +1451,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    device_carry_control_enabled = true;
+    bool    device_draft_carry = false;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    std::vector<int32_t>            pending_device_row;
+    std::vector<bool>               pending_device_valid;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1466,6 +1471,63 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    bool     transport_stats_enabled     = false;
+    uint64_t transport_process_calls     = 0;
+    uint64_t transport_draft_calls       = 0;
+    uint64_t transport_host_copies       = 0;
+    uint64_t transport_host_copy_bytes   = 0;
+    int64_t  transport_host_copy_us      = 0;
+    uint64_t transport_draft_decodes     = 0;
+    uint64_t transport_draft_input_rows  = 0;
+    uint64_t transport_draft_input_bytes = 0;
+
+    void transport_hidden_copy(void * dst, const void * src, size_t bytes) {
+        if (!transport_stats_enabled) {
+            std::memcpy(dst, src, bytes);
+            return;
+        }
+
+        const int64_t start_us = ggml_time_us();
+        std::memcpy(dst, src, bytes);
+        transport_host_copy_us += ggml_time_us() - start_us;
+        transport_host_copies++;
+        transport_host_copy_bytes += bytes;
+    }
+
+    void transport_record_decode(const common_batch & decode_batch) {
+        if (!transport_stats_enabled) {
+            return;
+        }
+
+        transport_draft_decodes++;
+        transport_draft_input_rows += decode_batch.size();
+        transport_draft_input_bytes += (uint64_t) decode_batch.size()*n_embd*sizeof(float);
+    }
+
+    void transport_flush(bool force = false) {
+        const uint64_t calls = transport_process_calls + transport_draft_calls;
+        if (!transport_stats_enabled || calls == 0 || (!force && calls < 64)) {
+            return;
+        }
+
+        SPC_INF("mtp_transport: process_calls=%" PRIu64 " draft_calls=%" PRIu64
+                " host_copies=%" PRIu64 " host_copy_bytes=%" PRIu64 " host_copy_us=%" PRId64
+                " draft_decodes=%" PRIu64 " logical_draft_input_rows=%" PRIu64
+                " logical_draft_input_bytes=%" PRIu64 "\n",
+                transport_process_calls, transport_draft_calls, transport_host_copies,
+                transport_host_copy_bytes, transport_host_copy_us, transport_draft_decodes,
+                transport_draft_input_rows, transport_draft_input_bytes);
+
+        transport_process_calls = 0;
+        transport_draft_calls = 0;
+        transport_host_copies = 0;
+        transport_host_copy_bytes = 0;
+        transport_host_copy_us = 0;
+        transport_draft_decodes = 0;
+        transport_draft_input_rows = 0;
+        transport_draft_input_bytes = 0;
+    }
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1479,6 +1541,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+
+        const char * transport_stats = std::getenv("GGML_SCHED_TRANSPORT_STATS");
+        transport_stats_enabled = transport_stats && std::atoi(transport_stats) != 0;
+        const char * device_carry = std::getenv("LLAMA_MTP_DEVICE_CARRY");
+        device_carry_control_enabled = device_carry == nullptr || std::atoi(device_carry) != 0;
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1522,6 +1589,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        device_draft_carry = device_carry_control_enabled && n_seq == 1 && !chain_heads && !is_mem_shared;
+        SPC_TRC("- device_draft_carry=%d\n", (int) device_draft_carry);
+        if (device_draft_carry) {
+            // Keep the graph output for backend sampling and carry snapshots,
+            // but suppress the redundant automatic D2H extraction.
+            llama_set_embeddings_nextn_host(ctx_dft, false);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1534,6 +1608,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_device_row.assign(n_seq, -1);
+        pending_device_valid.assign(n_seq, false);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1544,7 +1620,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        transport_flush(true);
+
         auto * ctx_dft = this->params.ctx_dft;
+        if (ctx_dft && device_draft_carry) {
+            llama_set_embeddings_nextn_host(ctx_dft, true);
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -1589,6 +1670,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.size();
 
+        if (transport_stats_enabled) {
+            transport_process_calls++;
+        }
+
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
@@ -1619,6 +1704,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0 && batch_in.tokens[i_batch_beg[seq_id]].pos[0] == 0) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                    pending_device_valid[seq_id] = false;
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1)) return false;
+                }
+            }
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -1638,8 +1731,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
             }
 
-            auto * mem_dft = llama_get_memory(ctx_dft);
-
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
@@ -1653,6 +1744,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                // The current target NextN output is still resident until the
+                // next target decode. For the common single-sequence native-MTP
+                // path, copy all shifted rows except the carry-in row directly
+                // into the draft input; the existing host batch remains the
+                // fallback when the source graph does not cover this ubatch.
+                if (!chain_heads && n_seq == 1 && n_tokens > 1) {
+                    llama_set_nextn_input_from(ctx_dft, ctx_tgt,
+                            /*src_row=*/ 0, /*dst_row=*/ 1, /*n_rows=*/ n_tokens - 1);
+                }
+
+                transport_record_decode(batch);
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
@@ -1681,18 +1783,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             for (int32_t i = 0; i < n_rows; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                transport_hidden_copy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
-            std::memcpy(pending_h[seq_id].data(),
+            transport_hidden_copy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            pending_device_row[seq_id] = i_batch_beg[seq_id] + n_rows - 1;
+            pending_device_valid[seq_id] = n_seq == 1;
         }
+
+        transport_flush();
 
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        if (transport_stats_enabled) {
+            transport_draft_calls++;
+        }
 
         batch.clear();
 
@@ -1735,6 +1845,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         int i = 0;
+        llama_context * device_input_src = nullptr;
+        int32_t device_input_src_row = -1;
+        if (device_carry_control_enabled && n_seq == 1 && drafting[0] && pending_device_valid[0]) {
+            device_input_src = params.ctx_tgt;
+            device_input_src_row = pending_device_row[0];
+        }
 
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
@@ -1753,6 +1869,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            if (n_seq == 1 && batch.size() == 1 && device_input_src != nullptr) {
+                const bool queued = llama_set_nextn_input_from(ctx_dft, device_input_src,
+                        device_input_src_row, /*dst_row=*/ 0, /*n_rows=*/ 1);
+                if (!queued && device_draft_carry && device_input_src == ctx_dft) {
+                    if (!llama_copy_embeddings_nextn_ith(
+                            ctx_dft, device_input_src_row, pending_h[0].data(), n_embd)) {
+                        SPC_ERR("%s", "failed to queue or recover the native-MTP device input\n");
+                        break;
+                    }
+                    device_input_src = nullptr;
+                }
+            }
+
+            transport_record_decode(batch);
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -1772,7 +1902,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                const int32_t h_device_row = i_last[seq_id];
+                const float * h_row = nullptr;
+                if (!device_draft_carry) {
+                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, h_device_row);
+                }
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1825,12 +1959,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
                     const int32_t idx = batch.add(id, dp.pos0, seq_id, true);
-                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                    batch.set_embd_state(idx, { h_row ? h_row : pending_h[seq_id].data(), 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 } else {
                     const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
-                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                    batch.set_embd_state(idx, { h_row ? h_row : pending_h[seq_id].data(), 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
+                }
+                if (device_carry_control_enabled && n_seq == 1) {
+                    device_input_src = ctx_dft;
+                    device_input_src_row = h_device_row;
+                } else if (device_draft_carry) {
+                    device_input_src = nullptr;
+                    device_input_src_row = -1;
                 }
             }
 
@@ -1855,6 +1996,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result->clear();
             }
         }
+
+        transport_flush();
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
@@ -1869,7 +2012,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        transport_hidden_copy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_device_row[seq_id] = i_batch_beg[seq_id] + i_h;
+        pending_device_valid[seq_id] = n_seq == 1;
     }
 };
 

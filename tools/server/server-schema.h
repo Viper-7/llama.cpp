@@ -101,6 +101,7 @@ task_params eval_llama_cmpl_schema(
                     const std::vector<llama_logit_bias> & logit_bias_eog,
                     const json & data);
 
+server_cache_control parse_cache_control(const json & value);
 std::vector<std::unique_ptr<field>> make_tts_schema(server_task & task);
 
 // evaluates the /tts request params into task.params and task.tts_inp.data

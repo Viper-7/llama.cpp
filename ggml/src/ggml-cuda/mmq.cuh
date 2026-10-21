@@ -3,7 +3,12 @@
 #include "common.cuh"
 
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
+#ifdef GGML_CUDA_TEST_MMQ_FORCE_J
+#include <atomic>
+#include <cstring>
+#endif
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
@@ -226,9 +231,27 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_gfx906(
+        ggml_type type, int J, bool fallback) {
+    // gfx906 can keep two four-wave IQ3_S J=8 workgroups resident with I=64;
+    // I=128 is limited to one workgroup by its approximately 40 KiB LDS tile.
+    if (type == GGML_TYPE_IQ3_S && J == 8 && !fallback) {
+        return ggml_cuda_mmq_config(
+            type, 256, 2, 64, 8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
+    }
+
+    if (type == GGML_TYPE_IQ3_S && J == 64) {
+        return ggml_cuda_mmq_config(
+            type, 512, 1, 128, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, fallback);
+    }
+
+    return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+}
+
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
+            if (cc == GGML_CUDA_CC_VEGA20) return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
             return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
         }
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -264,7 +287,11 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
 #ifdef GGML_USE_HIP
 #ifdef GCN
+#if defined(__gfx906__)
+    return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
+#else
     return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+#endif
 #elif defined(CDNA)
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
 #elif defined(RDNA4)

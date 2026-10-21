@@ -48,6 +48,17 @@ int main(void) {
 
         } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
             const mtmd_image_tokens * image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+            const float * external_embd = mtmd_input_chunk_get_embd(chunk);
+            if (external_embd != NULL) {
+                assert(image_tokens == NULL);
+                assert(mtmd_input_chunk_get_n_tokens(chunk) == 2);
+                assert(mtmd_input_chunk_get_n_pos(chunk) == 2);
+                assert(mtmd_input_chunk_get_n_embd(chunk) == 3);
+                assert(mtmd_input_chunk_get_n_pos_per_embd(chunk) == 4);
+                assert(mtmd_input_chunk_get_pos(chunk) != NULL);
+                assert(mtmd_input_chunk_get_use_non_causal(chunk));
+                continue;
+            }
             size_t n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
             // get position of the last token, which should be (nx - 1, ny - 1)
             struct mtmd_decoder_pos pos = mtmd_image_tokens_get_decoder_pos(image_tokens, 0, n_tokens - 1);
@@ -123,6 +134,14 @@ int main(void) {
             printf("    Chunk %zu: loaded id '%s' (orig '%s')\n", i, id_loaded, id_orig);
             assert(id_orig != NULL && id_loaded != NULL);
             assert(strcmp(id_orig, id_loaded) == 0);
+            if (mtmd_input_chunk_get_embd(chunk) != NULL) {
+                // Serialized external chunks retain metadata but not request payloads.
+                assert(mtmd_input_chunk_get_embd(loaded) == NULL);
+                assert(mtmd_input_chunk_get_pos(loaded) == NULL);
+                assert(mtmd_input_chunk_get_n_embd(loaded) == mtmd_input_chunk_get_n_embd(chunk));
+                assert(mtmd_input_chunk_get_n_pos_per_embd(loaded) == mtmd_input_chunk_get_n_pos_per_embd(chunk));
+                assert(mtmd_input_chunk_get_use_non_causal(loaded));
+            }
         }
 
         mtmd_input_chunk_free(loaded);

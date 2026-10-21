@@ -41,7 +41,8 @@ common_params_fit_status common_fit_params(
 void common_fit_print(
                          const char * path_model,
                  llama_model_params * mparams,
-               llama_context_params * cparams);
+               llama_context_params * cparams,
+      const common_fit_extra_model * extra);
 
 void common_memory_breakdown_print(const llama_context * ctx);
 

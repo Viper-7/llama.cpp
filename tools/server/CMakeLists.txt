@@ -31,9 +31,18 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# A server-only extension package inherits the selected immutable HIP libraries.
+# Keep its server guards identical without building/loading a new GPU backend.
+option(LLAMA_SERVER_SELECTED_HIP_COMPAT "Match selected HIP server definitions" OFF)
+if(LLAMA_SERVER_SELECTED_HIP_COMPAT)
+    target_compile_definitions(${TARGET} PRIVATE GGML_USE_CUDA GGML_USE_HIP)
+endif()
+
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd vendor-hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+find_package(CURL REQUIRED)
+target_link_libraries(${TARGET} PUBLIC CURL::libcurl)
 
 # llama-server-impl: server logic, reusable by app
 

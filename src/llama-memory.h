@@ -6,8 +6,12 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <stdexcept>
 
 struct llama_ubatch;
+
+// Range-state restore appends attention cells while replacing the recurrent boundary.
+static constexpr llama_state_seq_flags LLAMA_STATE_SEQ_FLAGS_APPEND_INTERNAL = 1u << 31;
 
 class llama_batch_allocr;
 
@@ -125,6 +129,13 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    virtual void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const {
+        if (p0 >= 0 || p1 >= 0) {
+            throw std::runtime_error("position-range state export is not supported by this memory type");
+        }
+        state_write(io, seq_id, flags);
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

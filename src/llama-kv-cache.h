@@ -114,7 +114,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+          ggml_backend_dev_t     dev_override = nullptr);
 
     ~llama_kv_cache() = default;
 
@@ -150,6 +151,7 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const override;
 
     //
     // llama_kv_cache specific API
@@ -160,6 +162,16 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+
+    // GLM-5-Next pooled-key cache. a pool groups cells by absolute position, so anything
+    // that mutates positions in place (seq_add / seq_div) regroups the pools while every
+    // cached pooled key still looks complete. set here, consumed and cleared by
+    // llama_kv_cache_set_input_kpool, which then emits every pool instead of only the new
+    // ones. sticky by design: a flag that never clears degrades to the pre-cache cost, a
+    // flag that clears too early is silently wrong.
+    void set_kpool_dirty();
+    bool get_kpool_dirty() const;
+    void clear_kpool_dirty() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -199,6 +211,13 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+
+    // write n_embd elements at element offset i_off inside each row, leaving the rest of
+    // the row untouched. k_idxs are GLOBAL rows (stream-merged), as in cpy_k.
+    // returns the ggml_set_rows result so a later gather can be chained off it and become
+    // a real graph edge rather than relying on build order.
+    ggml_tensor * cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+            int64_t n_embd, int64_t i_off) const;
 
     //
     // preparation API
@@ -267,6 +286,10 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // see set_kpool_dirty. mutable because the only consumer runs from set_input, which
+    // holds the cache by const pointer; nothing else observes it.
+    mutable bool kpool_dirty = false;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -350,7 +373,7 @@ private:
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, bool append = false);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
@@ -368,6 +391,11 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a bounded reserve-only cache context
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_kv);
 
     // used to create an update context
     llama_kv_cache_context(
@@ -400,6 +428,16 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // the stream RANGE s1 - s0 + 1 that get_k/get_v use as `ns`, not n_seqs_unq
+    uint32_t get_n_stream() const;
+
+    // physical stream backing view index s, i.e. sinfo.strm[s]. a global cache row for a
+    // cell j of that view is get_strm(s)*kv->get_size() + j, the convention set_input_k_idxs
+    // uses. needed by the k-pool code, which writes cells that are not ubatch tokens.
+    uint32_t get_strm(uint32_t s) const;
+
+    const llama_kv_cache * get_kv() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -414,6 +452,8 @@ public:
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+            int64_t n_embd, int64_t i_off) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache

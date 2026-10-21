@@ -236,6 +236,14 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    // Load the tensor named by source_tn, but choose its operation, layer buffer
+    // list, and tensor override using placement_tn. This is used for explicit
+    // device-local duplicates of shared weights.
+    struct ggml_tensor * create_tensor_as(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & source_tn, const LLM_TN_IMPL & placement_tn,
+        const std::initializer_list<int64_t> & ne, int flags);
+
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);

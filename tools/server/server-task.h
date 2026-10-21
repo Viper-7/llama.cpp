@@ -16,12 +16,16 @@
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
+    SERVER_TASK_TYPE_HIDDEN_STATE,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_TRANSCRIBE_RT,
     SERVER_TASK_TYPE_CANCEL,
+    SERVER_TASK_TYPE_RESPONSES_SUSPEND,
+    SERVER_TASK_TYPE_RESPONSES_CONTEXT,
     SERVER_TASK_TYPE_CONTROL,
+    SERVER_TASK_TYPE_CACHE_RELEASE,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_GET,
@@ -51,6 +55,18 @@ enum stop_type {
     STOP_TYPE_LIMIT,
 };
 
+#include "server-cache-policy.h"
+
+enum class server_cache_priority { background, interactive };
+enum class server_cache_lifecycle { retained, ephemeral, one_shot };
+
+struct server_cache_control {
+    server_cache_priority priority = server_cache_priority::background;
+    server_cache_lifecycle lifecycle = server_cache_lifecycle::retained;
+    std::string branch;
+    int request_id = -1; // native task identity, never caller-controlled
+};
+
 enum server_control_action {
     SERVER_CONTROL_ACTION_NONE,
     SERVER_CONTROL_ACTION_REASONING_END,
@@ -60,9 +76,12 @@ enum server_control_action {
 };
 
 struct task_params {
+    std::string serverless_request_id; // immutable owner-bound native attempt identity
     bool stream          = false;
     bool include_usage   = false;
+    bool prefill_only    = false; // finish before sampling
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    server_cache_control cache_control;
     bool return_tokens   = false;
     bool return_progress = false;
 
@@ -100,6 +119,9 @@ struct task_params {
     server_control_action control_action = SERVER_CONTROL_ACTION_NONE;
     std::string           control_cmpl_id;
     std::vector<float>    control_audio; // PCM F32 samples for SERVER_CONTROL_ACTION_AUDIO_APPEND
+    std::string response_scope;
+    std::string response_revision;
+    uint64_t response_generation = 0;
 
     // reported in generation_settings, parsing itself is owned by the chat session
     common_chat_format      chat_format      = COMMON_CHAT_FORMAT_CONTENT_ONLY;
@@ -221,6 +243,9 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
+    // used by SERVER_TASK_TYPE_CACHE_RELEASE
+    std::string cache_branch;
+    json response_context;
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
 
@@ -235,6 +260,7 @@ struct server_task {
     bool need_embd() const {
         switch (type) {
             case SERVER_TASK_TYPE_EMBEDDING:
+            case SERVER_TASK_TYPE_HIDDEN_STATE:
             case SERVER_TASK_TYPE_RERANK:
                 return true;
             case SERVER_TASK_TYPE_DECISION:
@@ -301,6 +327,13 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.hidden_state_layers          = hidden_state_layers;
+        copy.hidden_state_token_indices   = hidden_state_token_indices;
+        copy.hidden_state_pooling         = hidden_state_pooling;
+        copy.hidden_state_encoding_format = hidden_state_encoding_format;
+        copy.hidden_state_include_tokens  = hidden_state_include_tokens;
+        copy.hidden_state_ltx25            = hidden_state_ltx25;
+        copy.hidden_state_position_offset  = hidden_state_position_offset;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
@@ -319,6 +352,13 @@ struct server_task {
         return id_parent != -1;
     }
 
+    std::set<int32_t> hidden_state_layers;
+    std::vector<int32_t> hidden_state_token_indices;
+    std::string hidden_state_pooling = "none";
+    std::string hidden_state_encoding_format = "json";
+    bool hidden_state_include_tokens = false;
+    bool hidden_state_ltx25 = false;
+    int32_t hidden_state_position_offset = 0;
     // embedding and rerank tasks always process their whole prompt, their state is never reused
     bool is_stateless() const {
         return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK;
@@ -532,6 +572,20 @@ struct server_task_result_embd : server_task_result {
     json to_json_oaicompat();
 };
 
+struct server_task_result_hidden_state : server_task_result {
+    std::vector<llama_token> tokens;
+    std::vector<int32_t> layers;
+    json hidden_states;
+    std::string pooling;
+    std::string encoding_format;
+    int32_t n_embd = 0;
+    int32_t n_tokens = 0;
+    bool include_tokens = false;
+    std::string binary_data;
+
+    json to_json() override;
+};
+
 struct server_task_result_tts : server_task_result {
     std::string audio; // raw bytes for this chunk (WAV or PCM, per request's out_type)
     int32_t     sample_rate = 0;
@@ -619,6 +673,29 @@ struct server_task_result_slot_erase : server_task_result {
     virtual json to_json() override;
 };
 
+struct server_task_result_responses_suspended : server_task_result {
+    std::string request_id;
+    json to_json() override {
+        return json::array({json{{"event", "serverless.suspended"}, {"data", {
+            {"type", "serverless.suspended"}, {"request_id", request_id}
+        }}}});
+    }
+    bool is_stop() override { return true; }
+};
+
+// Both the first and subsequent Responses SSE reads must accept suspension.
+// A suspension marker can arrive after progress output during long prefill.
+inline bool server_task_result_is_completion_stream(const server_task_result * result) {
+    return dynamic_cast<const server_task_result_cmpl_partial *>(result) != nullptr
+        || dynamic_cast<const server_task_result_cmpl_final *>(result) != nullptr
+        || dynamic_cast<const server_task_result_responses_suspended *>(result) != nullptr;
+}
+
+struct server_task_result_responses_context : server_task_result {
+    json proof;
+    json to_json() override { return proof; }
+};
+
 struct server_task_result_control : server_task_result {
     bool        success = false;
     std::string message; // optional detail when success is false
@@ -629,6 +706,15 @@ struct server_task_result_control : server_task_result {
             out["message"] = message;
         }
         return out;
+    }
+};
+
+struct server_task_result_cache_release : server_task_result {
+    bool success = false;
+    size_t released_nodes = 0;
+
+    virtual json to_json() override {
+        return json{{"success", success}, {"released_nodes", released_nodes}};
     }
 };
 
@@ -715,7 +801,12 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    void save_shared(const server_prompt_cache_state & state) const;
+
     void update();
+
+private:
+    bool load_shared(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const;
 };
 
 // used exclusively by router mode
@@ -726,3 +817,15 @@ struct server_task_result_router : server_task_result {
         return new server_task_result_router(*this);
     }
 };
+
+bool server_shared_prompt_cache_enabled();
+
+void server_shared_prompt_cache_save(const server_prompt_cache_state & state);
+
+bool server_shared_prompt_cache_load(
+    server_prompt & prompt,
+    const server_tokens & tokens_new,
+    llama_context * ctx_tgt,
+    llama_context * ctx_dft,
+    int32_t id_slot,
+    bool * failed_restore = nullptr);

@@ -10,27 +10,53 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-page-ram.h"
+#include "server-responses-control.h"
+#include "server-responses-leases.h"
 
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-context.h"
+#include "../../src/llama-ext.h"
+#include "../../src/llama-model.h"
+#include "vendor/hash/hash.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "moe-route-trace.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstddef>
 #include <cinttypes>
+#include <csignal>
+#include <cstring>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <filesystem>
+#include <list>
 #include <random>
+#include <unordered_map>
 #include <utility>
 #include <fstream>
+#include <mutex>
+#include <thread>
+
+#if defined(__linux__)
+#include <dirent.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -42,6 +68,55 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Optional profiler annotations are resolved at runtime so ordinary server
+// builds do not acquire a ROCm profiler dependency. ROCtx ranges are
+// thread-local, so construct the scope inside the queue callback that performs
+// the actual decode work.
+struct server_roctx_scope {
+    using push_fn = int (*)(const char *);
+    using pop_fn  = int (*)();
+
+    explicit server_roctx_scope(const char * name) {
+#if defined(__linux__)
+        if (!enabled()) {
+            return;
+        }
+
+        static void * handle = dlopen("libroctx64.so", RTLD_LAZY | RTLD_LOCAL);
+        static auto push = handle ? reinterpret_cast<push_fn>(dlsym(handle, "roctxRangePushA")) : nullptr;
+        static auto pop  = handle ? reinterpret_cast<pop_fn>(dlsym(handle, "roctxRangePop")) : nullptr;
+        pop_ = pop;
+        if (push && pop_) {
+            push(name);
+            active_ = true;
+        }
+#else
+        (void) name;
+#endif
+    }
+
+    ~server_roctx_scope() {
+        if (active_) {
+            pop_();
+        }
+    }
+
+    server_roctx_scope(const server_roctx_scope &) = delete;
+    server_roctx_scope & operator=(const server_roctx_scope &) = delete;
+
+private:
+    static bool enabled() {
+        static const bool value = []() {
+            const char * raw = std::getenv("LLAMA_SERVER_ROCTX_RANGES");
+            return raw && raw[0] != '\0' && std::strcmp(raw, "0") != 0;
+        }();
+        return value;
+    }
+
+    pop_fn pop_ = nullptr;
+    bool active_ = false;
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -132,6 +207,292 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     result.push_back(id);
 
     return result;
+}
+
+static int64_t server_load_watchdog_timeout_ms() {
+    const char * raw = std::getenv("LLAMA_SERVER_LOAD_PROGRESS_STALL_TIMEOUT_S");
+    if (raw == nullptr || raw[0] == 0) {
+        return 0;
+    }
+    char * end = nullptr;
+    const double seconds = std::strtod(raw, &end);
+    if (end == raw || seconds <= 0.0) {
+        return 0;
+    }
+    return (int64_t) (seconds * 1000.0);
+}
+
+#if defined(__linux__)
+static void server_load_watchdog_signal_handler(int signo) {
+    void * frames[128];
+    const int n_frames = backtrace(frames, 128);
+    dprintf(STDERR_FILENO, "\n[load-watchdog] signal %d thread %ld stack:\n", signo, (long) syscall(SYS_gettid));
+    backtrace_symbols_fd(frames, n_frames, STDERR_FILENO);
+}
+
+static void server_load_watchdog_install_signal_handler() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = server_load_watchdog_signal_handler;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = SA_RESTART;
+        sigaction(SIGUSR2, &action, nullptr);
+    });
+}
+
+static void server_load_watchdog_dump_process_state(const char * model_path, float progress, int64_t idle_ms) {
+    SRV_ERR("llama.cpp load watchdog: model load stalled for %.3f s at progress %.6f for %s\n",
+            idle_ms / 1000.0, progress, model_path ? model_path : "");
+
+    std::ifstream status("/proc/self/status");
+    if (status.good()) {
+        SRV_ERR("%s", "llama.cpp load watchdog: /proc/self/status follows\n");
+        std::string line;
+        while (std::getline(status, line)) {
+            SRV_ERR("  %s\n", line.c_str());
+        }
+    }
+
+    SRV_ERR("%s", "llama.cpp load watchdog: skipping in-process stack signal before forced exit\n");
+}
+#endif
+
+struct server_load_progress_watchdog {
+    llama_progress_callback previous_callback = nullptr;
+    void * previous_user_data = nullptr;
+    const char * model_path = nullptr;
+    int64_t timeout_ms = 0;
+    std::atomic<int64_t> last_progress_ms{0};
+    std::atomic<float> last_progress{0.0f};
+    std::atomic<bool> active{false};
+    std::atomic<bool> done{false};
+    std::thread thread;
+
+    ~server_load_progress_watchdog() {
+        stop();
+    }
+
+    static bool callback(float progress, void * user_data) {
+        auto * self = static_cast<server_load_progress_watchdog *>(user_data);
+        self->active.store(true, std::memory_order_relaxed);
+        self->last_progress.store(progress, std::memory_order_relaxed);
+        self->last_progress_ms.store(ggml_time_ms(), std::memory_order_relaxed);
+        if (self->previous_callback != nullptr) {
+            return self->previous_callback(progress, self->previous_user_data);
+        }
+        return true;
+    }
+
+    void start() {
+        if (timeout_ms <= 0) {
+            return;
+        }
+        last_progress_ms.store(ggml_time_ms(), std::memory_order_relaxed);
+#if defined(__linux__)
+        server_load_watchdog_install_signal_handler();
+#endif
+        thread = std::thread([this]() {
+            while (!done.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                if (done.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (!active.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                const int64_t now = ggml_time_ms();
+                const int64_t idle_ms = now - last_progress_ms.load(std::memory_order_relaxed);
+                if (idle_ms < timeout_ms) {
+                    continue;
+                }
+#if defined(__linux__)
+                dprintf(STDERR_FILENO,
+                        "llama.cpp load watchdog: forced exit after %.3f s stall at progress %.6f for %s\n",
+                        idle_ms / 1000.0, last_progress.load(std::memory_order_relaxed), model_path ? model_path : "");
+                _exit(134);
+#else
+                SRV_ERR("llama.cpp load watchdog: model load stalled for %.3f s at progress %.6f for %s\n",
+                        idle_ms / 1000.0, last_progress.load(std::memory_order_relaxed), model_path ? model_path : "");
+                std::abort();
+#endif
+            }
+        });
+    }
+
+    void stop() {
+        done.store(true, std::memory_order_relaxed);
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
+static std::vector<int32_t> parse_hidden_state_layers(const json & body, int32_t n_layer) {
+    std::vector<int32_t> layers;
+
+    if (body.contains("layers") && body.at("layers").is_array()) {
+        for (const auto & item : body.at("layers")) {
+            if (!item.is_number_integer()) {
+                throw std::runtime_error("layers must contain only integers");
+            }
+            layers.push_back(item.get<int32_t>());
+        }
+    } else if (body.contains("layer_start") && body.contains("layer_end")) {
+        const int32_t layer_start = body.at("layer_start").get<int32_t>();
+        const int32_t layer_end   = body.at("layer_end").get<int32_t>();
+        if (layer_start > layer_end) {
+            throw std::runtime_error("layer_start must be less than or equal to layer_end");
+        }
+        for (int32_t il = layer_start; il <= layer_end; ++il) {
+            layers.push_back(il);
+        }
+    } else {
+        throw std::runtime_error("layers or layer_start/layer_end is required");
+    }
+
+    if (layers.empty()) {
+        throw std::runtime_error("at least one hidden-state layer is required");
+    }
+    for (int32_t il : layers) {
+        if (il < 0 || il >= n_layer) {
+            throw std::runtime_error("hidden-state layer index is outside the model layer range");
+        }
+    }
+
+    std::sort(layers.begin(), layers.end());
+    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+    return layers;
+}
+
+static std::vector<int32_t> parse_hidden_state_token_indices(const json & body, int32_t n_tokens) {
+    std::vector<int32_t> indices;
+    if (!body.contains("token_indices") || body.at("token_indices").is_null()) {
+        indices.reserve(n_tokens);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            indices.push_back(i);
+        }
+        return indices;
+    }
+
+    if (!body.at("token_indices").is_array()) {
+        throw std::runtime_error("token_indices must be an integer array");
+    }
+    for (const auto & item : body.at("token_indices")) {
+        if (!item.is_number_integer()) {
+            throw std::runtime_error("token_indices must contain only integers");
+        }
+        int32_t idx = item.get<int32_t>();
+        if (idx < 0) {
+            idx += n_tokens;
+        }
+        if (idx < 0 || idx >= n_tokens) {
+            throw std::runtime_error("token index is outside the prompt token range");
+        }
+        indices.push_back(idx);
+    }
+    if (indices.empty()) {
+        throw std::runtime_error("token_indices must not be empty");
+    }
+    return indices;
+}
+
+static std::mutex g_sensitive_trace_mutex;
+static std::atomic<uint64_t> g_sensitive_trace_next_id{1};
+
+static const char * sensitive_trace_path() {
+    const char * path = std::getenv("LLAMA_CPP_SERVER_SENSITIVE_TRACE_PATH");
+    if (path == nullptr || path[0] == '\0') {
+        return nullptr;
+    }
+    return path;
+}
+
+static void sensitive_trace_append(const std::string & text) {
+    const char * path = sensitive_trace_path();
+    if (path == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_sensitive_trace_mutex);
+    std::ofstream file(path, std::ios::out | std::ios::app | std::ios::binary);
+    if (!file) {
+        return;
+    }
+    file << text;
+    file.flush();
+
+    std::error_code ec;
+    std::filesystem::permissions(
+        path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace,
+        ec);
+}
+
+static void sensitive_trace_append_json_text(std::string & out, const json & value) {
+    if (value.is_string()) {
+        out += value.get<std::string>();
+        return;
+    }
+    if (!value.is_array()) {
+        return;
+    }
+    for (const auto & item : value) {
+        if (item.is_string()) {
+            out += item.get<std::string>();
+        } else if (item.is_object()) {
+            if (item.contains("text") && item.at("text").is_string()) {
+                out += item.at("text").get<std::string>();
+            }
+        }
+    }
+}
+
+static std::string sensitive_trace_output_text(const json & res_json) {
+    std::string out;
+
+    auto append_key = [&](const json & obj, const char * key) {
+        if (obj.contains(key)) {
+            sensitive_trace_append_json_text(out, obj.at(key));
+        }
+    };
+
+    append_key(res_json, "content");
+    append_key(res_json, "text");
+    append_key(res_json, "delta");
+
+    if (res_json.contains("choices") && res_json.at("choices").is_array()) {
+        for (const auto & choice : res_json.at("choices")) {
+            if (!choice.is_object()) {
+                continue;
+            }
+            append_key(choice, "text");
+            if (choice.contains("delta") && choice.at("delta").is_object()) {
+                const auto & delta = choice.at("delta");
+                append_key(delta, "reasoning_content");
+                append_key(delta, "content");
+                append_key(delta, "text");
+                if (delta.contains("tool_calls") && delta.at("tool_calls").is_array()) {
+                    for (const auto & tool_call : delta.at("tool_calls")) {
+                        if (!tool_call.is_object()) {
+                            continue;
+                        }
+                        if (tool_call.contains("function") && tool_call.at("function").is_object()) {
+                            append_key(tool_call.at("function"), "arguments");
+                        }
+                    }
+                }
+            }
+            if (choice.contains("message") && choice.at("message").is_object()) {
+                append_key(choice.at("message"), "reasoning_content");
+                append_key(choice.at("message"), "content");
+            }
+        }
+    }
+
+    return out;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -254,6 +615,1185 @@ struct server_batch {
     }
 };
 
+class server_prompt_page_cache {
+public:
+    struct counters {
+        uint64_t capture_attempts = 0;
+        uint64_t capture_us       = 0;
+        uint64_t capture_last_us  = 0;
+        uint64_t restore_attempts = 0;
+        uint64_t restore_us       = 0;
+        uint64_t restore_last_us  = 0;
+        uint64_t captures         = 0;
+        uint64_t hits             = 0;
+        uint64_t misses           = 0;
+        uint64_t restored_tokens  = 0;
+        uint64_t evictions        = 0;
+        uint64_t failures         = 0;
+        uint64_t verify_attempts  = 0;
+        uint64_t verify_failures  = 0;
+        uint64_t branch_releases  = 0;
+        uint64_t live_prefix_adoptions = 0;
+        uint64_t capture_bridges = 0;
+        uint64_t superseded_pruned = 0;
+        uint64_t manifest_node_builds = 0, manifest_node_reuses = 0;
+        uint64_t persist_attempts = 0, persist_us = 0, persist_build_us = 0, persist_write_us = 0;
+        uint64_t capture_sync_us = 0, capture_alloc_us = 0, capture_copy_us = 0, capture_seal_us = 0;
+        uint64_t ssd_maintenance_runs = 0;
+        uint64_t ram_demotions = 0, ssd_restores = 0, ssd_restored_bytes = 0, ssd_restore_us = 0, ssd_restore_failures = 0, capture_waiting_backup = 0;
+    };
+
+    server_prompt_page_cache(size_t limit_size, size_t page_tokens) :
+        limit_size(server_page_ram_store::effective_limit(limit_size)), page_tokens(page_tokens), ram_store(this->limit_size) {
+        GGML_ASSERT(limit_size > 0);
+        GGML_ASSERT(page_tokens > 0);
+        recover();
+        maintain_ssd({});
+    }
+
+    void maintenance(const std::unordered_set<int> & active_tasks) {
+        const auto now = server_cache_now_ms();
+        if (now < next_ssd_maintenance_ms) return;
+        next_ssd_maintenance_ms = now + 1000;
+        std::unordered_set<std::string> protected_keys;
+        for (const auto & node : pages) if (active_tasks.count(node.usage.last_request)) protected_keys.insert(node.key);
+        maintain_ssd(protected_keys);
+    }
+
+    json tier_stats() const {
+        const auto * disk = ram_store.disk_store();
+        json result = disk ? json::parse(disk->stats().dump()) : json{{"enabled", false}};
+        result["ram_bytes"] = size_cur; result["ram_limit_bytes"] = limit_size;
+        result["demotions"] = stats_cur.ram_demotions; result["ssd_restores"] = stats_cur.ssd_restores;
+        result["ssd_restored_bytes"] = stats_cur.ssd_restored_bytes; result["ssd_restore_us"] = stats_cur.ssd_restore_us;
+        result["ssd_restore_failures"] = stats_cur.ssd_restore_failures;
+        result["capture_waiting_backup"] = stats_cur.capture_waiting_backup;
+        result["maintenance_runs"] = stats_cur.ssd_maintenance_runs;
+        return result;
+    }
+
+    json persistence_stats() const {
+        return {{"enabled", ram_store.active()}, {"tiers", tier_stats()}, {"recovered_pages", ram_store.recovered},
+            {"rejected_pages", ram_store.rejected}, {"commits", ram_store.commits},
+            {"failures", ram_store.failures}, {"orphan_files", ram_store.orphan_files},
+            {"stale_namespaces", ram_store.stale_namespaces}, {"stale_bytes", ram_store.stale_bytes}};
+    }
+
+    json replacement_stats() const {
+        const uint64_t now = server_cache_now_ms();
+        size_t known = 0, cold = 0, retrievals = 0;
+        uint64_t oldest_ms = 0;
+        for (const auto & node : pages) {
+            if (node.usage.last_access_ms) {
+                known++;
+                oldest_ms = std::max(oldest_ms, now > node.usage.last_access_ms ? now - node.usage.last_access_ms : 0);
+            } else { cold++; }
+            retrievals += node.usage.retrievals;
+        }
+        return {{"name", "age_frequency_density_v1"}, {"history_known_pages", known},
+            {"legacy_cold_pages", cold}, {"bounded_retrievals", retrievals}, {"oldest_access_age_s", oldest_ms / 1000},
+            {"incidental_interactive_half_life_s", 1800}, {"retained_interactive_half_life_s", 3600},
+            {"retained_background_half_life_s", 28800}, {"ephemeral_half_life_s", 900},
+            {"retrieval_count_cap", 15}, {"release_grace_s", 30},
+            {"superseded_partial_idle_s", 1800}, {"superseded_pruned", stats_cur.superseded_pruned},
+            {"recent_evictions", json::parse(eviction_history.dump())}};
+    }
+
+    size_t page_size_tokens() const {
+        return page_tokens;
+    }
+
+    size_t size() const {
+        return size_cur;
+    }
+
+    size_t limit() const {
+        return limit_size;
+    }
+
+    size_t target_size() const {
+        return size_tgt_cur;
+    }
+
+    size_t draft_size() const {
+        return size_dft_cur;
+    }
+
+    size_t metadata_size() const {
+        return size_cur - size_tgt_cur - size_dft_cur;
+    }
+
+    size_t count() const {
+        return pages.size();
+    }
+
+    const counters & stats() const {
+        return stats_cur;
+    }
+
+    bool prepare_lease(const std::string & scope, const std::string & revision,
+                       const std::string & expected, uint64_t generation, uint64_t ttl) {
+        return mutate_lease([&] { return response_leases.prepare(scope, revision, expected,
+            server_cache_now_ms(), ttl, generation); });
+    }
+
+    bool observe_lease(const std::string & scope, const std::string & revision,
+                       const std::string & branch, size_t minimum_tokens, bool complete) {
+        // Validate the actual reachable endpoint, including sparse tail pages.
+        // A branch label by itself is not evidence of a complete checkpoint.
+        auto endpoint = pages.end();
+        for (auto node = pages.begin(); node != pages.end(); ++node) {
+            if (node->branches.count(branch) && node->p1_tokens >= minimum_tokens &&
+                    (endpoint == pages.end() || node->p1_tokens > endpoint->p1_tokens)) endpoint = node;
+        }
+        if (endpoint == pages.end()) return false;
+        server_responses_leases::page_sizes ancestry;
+        auto node = endpoint;
+        while (true) {
+            const size_t bytes = node->data_tgt.size() + node->data_dft.size() + node->data_tgt_reference.size();
+            if (!bytes || !ancestry.emplace(node->key, bytes).second) return false;
+            if (node->parent_key.empty()) {
+                if (node->p0_tokens != 0 || node->p0_pos != 0) return false;
+                break;
+            }
+            const auto parent = by_key.find(node->parent_key);
+            if (parent == by_key.end() || parent->second->p1_tokens != node->p0_tokens ||
+                    parent->second->p1_pos != node->p0_pos) return false;
+            node = parent->second;
+        }
+        return mutate_lease([&] { return response_leases.observe(scope, revision, ancestry,
+            complete, server_cache_now_ms()); });
+    }
+
+    bool commit_lease(const std::string & scope, const std::string & revision,
+                      const std::string & expected, uint64_t ttl) {
+        const auto found = response_leases.snapshot().find(scope);
+        if (found == response_leases.snapshot().end()) return false;
+        for (const auto & page : found->second.pending.pages) {
+            const auto node = by_key.find(page.first);
+            if (node == by_key.end() || page.second != node->second->data_tgt.size() +
+                    node->second->data_dft.size() + node->second->data_tgt_reference.size()) return false;
+        }
+        return mutate_lease([&] { return response_leases.commit(scope, revision, expected,
+            server_cache_now_ms(), ttl); });
+    }
+
+    bool release_lease(const std::string & scope, const std::string & expected) {
+        return mutate_lease([&] { return response_leases.release(scope, expected, server_cache_now_ms()); });
+    }
+
+    bool lease_prepared(const std::string & scope, const std::string & revision, uint64_t generation) const {
+        const auto found = response_leases.snapshot().find(scope);
+        return found != response_leases.snapshot().end() && found->second.generation == generation &&
+            found->second.pending.revision == revision && found->second.pending.expires > server_cache_now_ms();
+    }
+
+    json context_control(const json & body) {
+        const auto scope = body.at("scope").get<std::string>();
+        const auto action = body.at("action").get<std::string>();
+        const auto revision = json_value(body, "revision", std::string{});
+        const auto expected = json_value(body, "expected", std::string{});
+        const auto ttl = json_value(body, "lease_ms", uint64_t(7200000));
+        bool success = action == "state";
+        if (action == "prepare") success = prepare_lease(scope, revision, expected, body.at("generation").get<uint64_t>(), ttl);
+        else if (action == "observe") success = observe_lease(scope, revision, body.at("branch").get<std::string>(),
+            body.at("minimum_tokens").get<size_t>(), true);
+        else if (action == "commit") {
+            const auto found = response_leases.snapshot().find(scope);
+            const auto old_head = found == response_leases.snapshot().end() ? std::string{} : found->second.head;
+            success = (found != response_leases.snapshot().end() && old_head == revision &&
+                found->second.expires > server_cache_now_ms()) || commit_lease(scope, revision, expected, ttl);
+            if (success && old_head != revision) {
+                // Drop only the old response's named claim. Shared ancestor and
+                // sibling ownership survives; old sparse tails become evictable.
+                const auto old_branch = json_value(body, "old_branch", std::string{});
+                if (!old_branch.empty()) release_branch(old_branch);
+            }
+        } else if (action == "release") success = release_lease(scope, expected);
+        else if (action == "abandon") success = mutate_lease([&] { return response_leases.abandon(scope, revision); });
+        json result = {{"success", success}, {"scope", scope}, {"head", ""}, {"generation", 0},
+            {"expires", 0}, {"pending_revision", ""}, {"pending_complete", false},
+            {"protected_state_bytes", response_leases.protected_bytes(server_cache_now_ms())},
+            {"protected_state_byte_limit", response_leases.limit()}, {"lease_ms", 7200000}, {"persistent", ram_store.active()},
+            {"namespace", std::getenv("LLAMA_SERVER_PAGE_CACHE_NAMESPACE") ? std::getenv("LLAMA_SERVER_PAGE_CACHE_NAMESPACE") : ""}};
+        const auto found = response_leases.snapshot().find(scope);
+        if (found != response_leases.snapshot().end()) {
+            const auto & state = found->second;
+            result["head"] = state.head;
+            result["generation"] = state.generation;
+            result["expires"] = state.expires;
+            result["pending_revision"] = state.pending.revision;
+            result["pending_complete"] = state.pending.endpoint_complete;
+            result["pending_expires"] = state.pending.expires;
+            result["pending_pages"] = state.pending.pages.size();
+        }
+        return result;
+    }
+
+    size_t release_branch(const std::string & branch) {
+        size_t released_nodes = 0;
+        std::unordered_set<std::string> affected;
+        for (auto & node : pages) {
+            const auto owner = node.branches.find(branch);
+            if (owner == node.branches.end()) {
+                continue;
+            }
+            size_cur -= owner->first.size() + sizeof(owner->second);
+            node.descriptor_dirty = true;
+            node.branches.erase(owner);
+            affected.insert(node.key);
+            released_nodes++;
+        }
+        // A fingerprint rollover may release the old branch immediately before
+        // submitting its replacement. Keep its now-unowned pages reusable for
+        // 30 seconds; adoption restores ownership, otherwise pressure GC can
+        // reclaim them once the grace expires. Existing shared claims survive.
+        const uint64_t deadline = server_cache_now_ms() + 30000;
+        for (auto & node : pages) {
+            if (affected.count(node.key) && !node.unowned_retained &&
+                    !node.unowned_ephemeral && node.branches.empty()) {
+                node.release_after_ms = deadline;
+            }
+        }
+        stats_cur.branch_releases++;
+        persist();
+        return released_nodes;
+    }
+
+    size_t match_tokens(const server_tokens & tokens) const {
+        return find_longest_chain(tokens, nullptr).tokens;
+    }
+
+    bool capture(
+            const server_tokens & tokens,
+                  llama_context * ctx_tgt,
+                  llama_context * ctx_dft,
+                   llama_seq_id   seq_id,
+            const server_cache_control & control,
+                           bool   exact_endpoint = false) {
+        if (control.lifecycle == server_cache_lifecycle::one_shot) {
+            return false;
+        }
+        const auto retained = find_longest_chain(tokens, ctx_dft);
+        maintain_ssd({retained.keys.begin(), retained.keys.end()});
+        prune_superseded({retained.keys.begin(), retained.keys.end()}, server_cache_now_ms());
+        const size_t p1_tokens = tokens.size();
+        const auto boundaries = tokens.page_boundaries(page_tokens);
+        const bool is_coarse = !boundaries.empty() && boundaries.back().token_count == p1_tokens;
+        if (!exact_endpoint && !is_coarse) {
+            return false;
+        }
+        if (p1_tokens == 0) {
+            return false;
+        }
+        const int64_t t_start = ggml_time_us();
+
+        const server_tokens::page_boundary end = is_coarse
+            ? boundaries.back()
+            : server_tokens::page_boundary{p1_tokens, tokens.pos_next()};
+        server_tokens::page_boundary begin;
+        for (const auto & boundary : boundaries) {
+            if (boundary.token_count >= end.token_count) {
+                break;
+            }
+            begin = boundary;
+        }
+        const auto nominal_begin = begin;
+        begin = capture_begin(tokens, ctx_dft, nominal_begin);
+        const bool bridging = begin.token_count != nominal_begin.token_count;
+        page value;
+        value.key       = tokens.cache_prefix_hash(end.token_count);
+        value.parent_key = begin.token_count > 0 ? tokens.cache_prefix_hash(begin.token_count) : std::string();
+        value.p0_tokens = begin.token_count;
+        value.p1_tokens = end.token_count;
+        value.p0_pos    = begin.position;
+        value.p1_pos    = end.position;
+        value.coarse    = is_coarse;
+
+        // Exact prefix identity alone determines whether two requests share a
+        // node. Branch names are retention hints and never part of the key.
+        if (const auto found = by_key.find(value.key); found != by_key.end()) {
+            mark_control(*found->second, control);
+            pages.splice(pages.end(), pages, found->second);
+            note_superseded(tokens, value.key, server_cache_now_ms());
+            persist();
+            record_capture(t_start);
+            return true;
+        }
+        value.record_control(control);
+
+        const size_t tgt_size = llama_state_seq_get_size_range_ext(ctx_tgt, seq_id, begin.position, end.position, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t dft_size = ctx_dft ? llama_state_seq_get_size_range_ext(ctx_dft, seq_id, begin.position, end.position, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t ref_size = tokens.has_media() && verify_restore_enabled()
+            ? llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t value_size = value.size() + tgt_size + dft_size + ref_size;
+        if (value_size > limit_size) {
+            record_capture(t_start);
+            SRV_WRN("range-state page %.3f MiB exceeds cache limit %.3f MiB, skipping\n",
+                    value_size / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+            return false;
+        }
+
+        const uint64_t rank_now = server_cache_now_ms();
+        // Keep the entire parent chain while making room for this child.
+        std::unordered_set<std::string> ancestors;
+        for (std::string key = value.parent_key; !key.empty();) {
+            const auto parent = by_key.find(key);
+            if (parent == by_key.end() || !ancestors.insert(key).second) {
+                record_capture(t_start);
+                stats_cur.failures++;
+                return false;
+            }
+            key = parent->second->parent_key;
+        }
+
+        bool reclaimed = false;
+        while (!pages.empty() && size_cur + value_size > limit_size) {
+            auto * disk = ram_store.disk_store();
+            if (disk && disk->active() && demote_ram()) { reclaimed = true; continue; }
+            if (disk && disk->active() && !disk->degraded() && disk->free_bytes() >= disk->reserve() &&
+                    value_size <= disk->free_bytes() - disk->reserve()) {
+                // Copies run independently; retaining a useful checkpoint must
+                // never turn the generation thread into an SSD write waiter.
+                stats_cur.capture_waiting_backup++;
+                persist(); record_capture(t_start); return false;
+            }
+            auto leaf = eviction_candidate(ancestors, rank_now);
+            if (disk && disk->active()) {
+                // A degraded writer must not delete cold graph leaves which
+                // reclaim no RAM. Preserve them and choose a resident leaf.
+                leaf = pages.end();
+                for (auto it = pages.begin(); it != pages.end(); ++it) {
+                    if (!(it->data_tgt.resident_size() + it->data_dft.resident_size() + it->data_tgt_reference.resident_size()) ||
+                            it->children || ancestors.count(it->key) || disk->pending(it->key) ||
+                            it->release_after_ms > rank_now || response_leases.protects(it->key, rank_now)) continue;
+                    if (leaf == pages.end() || it->eviction_rank(rank_now).less_than(leaf->eviction_rank(rank_now))) leaf = it;
+                }
+            }
+            if (leaf == pages.end()) {
+                persist();
+                record_capture(t_start);
+                SRV_WRN("%s", "range-state graph has no evictable leaf below cache limit, skipping node\n");
+                return false;
+            }
+            evict(leaf);
+            reclaimed = true;
+        }
+
+        // Publish reclamation before allocation so tmpfs has space and a crash cannot revive removed pages.
+        if (reclaimed) persist();
+        if (!capture_state(ctx_tgt, seq_id, begin.position, end.position, value.data_tgt) ||
+                (ctx_dft && !capture_state(ctx_dft, seq_id, begin.position, end.position, value.data_dft))) {
+            persist();
+            record_capture(t_start);
+            stats_cur.failures++;
+            return false;
+        }
+        if (tokens.has_media() && verify_restore_enabled() &&
+                !capture_full_state(ctx_tgt, seq_id, value.data_tgt_reference)) {
+            persist();
+            record_capture(t_start);
+            stats_cur.failures++;
+            return false;
+        }
+
+        pages.push_back(std::move(value));
+        const auto added = std::prev(pages.end());
+        by_key.emplace(added->key, added);
+        endpoint_counts[added->p1_tokens]++;
+        if (!added->parent_key.empty()) {
+            const auto parent = by_key.find(added->parent_key);
+            GGML_ASSERT(parent != by_key.end());
+            parent->second->children++;
+        }
+        size_cur += value_size;
+        size_tgt_cur += added->data_tgt.size() + added->data_tgt_reference.size();
+        size_dft_cur += added->data_dft.size();
+        record_capture(t_start);
+        stats_cur.captures++;
+        ancestors.insert(added->key);
+        maintain_ssd(ancestors);
+        note_superseded(tokens, added->key, server_cache_now_ms());
+        if (bridging) {
+            stats_cur.capture_bridges++;
+            SRV_TRC("range-state capture bridged missing boundary %zu from %zu to %zu tokens\n",
+                    nominal_begin.token_count, begin.token_count, end.token_count);
+        }
+        persist();
+        return true;
+    }
+
+    size_t restore(
+            const server_tokens & tokens,
+                         size_t   current_lcp,
+                         bool     live_requires_rewind,
+                  llama_context * ctx_tgt,
+                  llama_context * ctx_dft,
+                   llama_seq_id   seq_id,
+            const server_cache_control & control,
+                           bool & failed) {
+        failed = false;
+        // A complete restored prompt has no logits and its hybrid recurrent
+        // endpoint cannot be rewound. Save that endpoint for continuations,
+        // but replay at least one last token for identical-prompt requests.
+        const chain_match match = find_longest_chain(tokens, ctx_dft, tokens.empty() ? 0 : tokens.size() - 1);
+        const auto & chain = match.keys;
+        const size_t restored_tokens = match.tokens;
+        // A hybrid live prefix can be longer than a saved coarse node while
+        // still being unusable: truncation of its recurrent endpoint fails
+        // later and would force a full prefill. Restore the exact graph node
+        // instead when the new prompt diverges and live rewind is unavailable.
+        if (restored_tokens == 0) {
+            if (tokens.size() >= page_tokens) stats_cur.misses++;
+            return 0;
+        }
+        if (restored_tokens <= current_lcp && !live_requires_rewind) {
+            // A real live-slot hit must refresh graph history even though no
+            // checkpoint import is necessary. One-shot retains its no-touch rule.
+            if (control.lifecycle != server_cache_lifecycle::one_shot) {
+                touch_chain(chain, control);
+                stats_cur.live_prefix_adoptions++;
+                persist();
+            }
+            return 0;
+        }
+        if (control.lifecycle != server_cache_lifecycle::one_shot) {
+            maintain_ssd({match.keys.begin(), match.keys.end()});
+            prune_superseded({match.keys.begin(), match.keys.end()}, server_cache_now_ms());
+        }
+        const int64_t t_start = ggml_time_us();
+
+        if (!clear_sequence(ctx_tgt, seq_id) || !clear_sequence(ctx_dft, seq_id)) {
+            record_restore(t_start);
+            stats_cur.failures++;
+            failed = true;
+            return 0;
+        }
+
+        for (const std::string & key : chain) {
+            const auto found = by_key.find(key);
+            GGML_ASSERT(found != by_key.end());
+            const auto & value = *found->second;
+            const uint64_t cold_bytes = (value.data_tgt.on_disk() ? value.data_tgt.size() : 0) +
+                (value.data_dft.on_disk() ? value.data_dft.size() : 0);
+            const auto cold_start = ggml_time_us();
+            if (!restore_state(ctx_tgt, seq_id, value.data_tgt) ||
+                    (ctx_dft && !restore_state(ctx_dft, seq_id, value.data_dft))) {
+                clear_sequence(ctx_tgt, seq_id);
+                clear_sequence(ctx_dft, seq_id);
+                if (cold_bytes) stats_cur.ssd_restore_failures++;
+                evict_graph(key, false);
+                persist();
+                record_restore(t_start);
+                stats_cur.failures++;
+                failed = true;
+                return 0;
+            }
+            if (cold_bytes) {
+                stats_cur.ssd_restored_bytes += cold_bytes;
+                stats_cur.ssd_restore_us += uint64_t(ggml_time_us() - cold_start);
+            }
+        }
+        if (std::any_of(chain.begin(), chain.end(), [&](const std::string & key) {
+                return by_key.at(key)->data_tgt.on_disk() || by_key.at(key)->data_dft.on_disk(); })) stats_cur.ssd_restores++;
+
+        const auto verify_found = by_key.find(chain.back());
+        const bool has_reference = verify_found != by_key.end() &&
+            !verify_found->second->data_tgt_reference.empty();
+        if (verify_restore_enabled() && has_reference) {
+            stats_cur.verify_attempts++;
+            const auto found = verify_found;
+            std::vector<uint8_t> restored_data;
+            const server_page_bytes * expected_data = nullptr;
+            if (found != by_key.end()) {
+                expected_data = !found->second->data_tgt_reference.empty()
+                    ? &found->second->data_tgt_reference
+                    : nullptr;
+            }
+            if (found == by_key.end() ||
+                    expected_data == nullptr ||
+                    !capture_full_state(ctx_tgt, seq_id, restored_data) ||
+                    !(*expected_data == restored_data)) {
+                if (expected_data != nullptr && !restored_data.empty()) {
+                    const size_t shared = std::min(expected_data->size(), restored_data.size());
+                    const auto mismatch = std::mismatch(
+                            expected_data->begin(), expected_data->begin() + shared, restored_data.begin());
+                    const size_t offset = mismatch.first == expected_data->begin() + shared
+                        ? shared
+                        : size_t(mismatch.first - expected_data->begin());
+                    SRV_ERR("page-cache restore verification diverged at byte %zu "
+                            "(reference %zu bytes, restored %zu bytes, pages %zu)\n",
+                            offset, expected_data->size(), restored_data.size(), chain.size());
+                }
+                clear_sequence(ctx_tgt, seq_id);
+                clear_sequence(ctx_dft, seq_id);
+                record_restore(t_start);
+                stats_cur.verify_failures++;
+                stats_cur.failures++;
+                failed = true;
+                return 0;
+            }
+        }
+
+        touch_chain(chain, control);
+
+        record_restore(t_start);
+        if (control.lifecycle != server_cache_lifecycle::one_shot) { persist(); }
+        stats_cur.hits++;
+        stats_cur.restored_tokens += restored_tokens;
+        return restored_tokens;
+    }
+
+private:
+    struct page {
+        std::string key;
+        std::string parent_key;
+        size_t p0_tokens = 0;
+        size_t p1_tokens = 0;
+        llama_pos p0_pos = 0;
+        llama_pos p1_pos = 0;
+        bool coarse = false;
+        size_t children = 0;
+        bool unowned_retained = false;
+        bool unowned_interactive = false;
+        bool unowned_ephemeral = false;
+        bool unowned_ephemeral_interactive = false;
+        server_cache_usage usage;
+        uint64_t release_after_ms = 0;
+        uint64_t superseded_at_ms = 0;
+        std::string superseded_by;
+        uint64_t ssd_retry_after_ms = 0;
+        std::map<std::string, std::pair<server_cache_priority, server_cache_lifecycle>> branches;
+        server_page_bytes data_tgt;
+        // Diagnostic-only uninterrupted state for attributing range composition.
+        server_page_bytes data_tgt_reference;
+        server_page_bytes data_dft;
+        // CPU-only descriptor cache; state buffers and persisted format are unchanged.
+        server_page_ram_store::json descriptor;
+        bool descriptor_dirty = true;
+
+        static size_t hint_index(server_cache_priority priority, server_cache_lifecycle lifecycle, bool named) {
+            const bool interactive = priority == server_cache_priority::interactive;
+            if (lifecycle != server_cache_lifecycle::retained) return interactive ? 4 : 5;
+            return interactive ? (named ? 1 : 0) : (named ? 2 : 3);
+        }
+
+        void record_control(const server_cache_control & control, bool reused = false) {
+            descriptor_dirty = true;
+            release_after_ms = 0;
+            superseded_at_ms = 0; // Returning to an old edit point renews its usefulness.
+            usage.touch(hint_index(control.priority, control.lifecycle, !control.branch.empty()),
+                        server_cache_now_ms(), control.request_id, reused);
+            if (!control.branch.empty()) {
+                branches[control.branch] = {control.priority, control.lifecycle};
+            } else if (control.lifecycle == server_cache_lifecycle::retained) {
+                unowned_retained = true;
+                unowned_interactive |= control.priority == server_cache_priority::interactive;
+            } else if (control.lifecycle == server_cache_lifecycle::ephemeral) {
+                unowned_ephemeral = true;
+                unowned_ephemeral_interactive |= control.priority == server_cache_priority::interactive;
+            }
+        }
+
+        size_t policy_size() const {
+            size_t result = 0;
+            for (const auto & branch : branches) {
+                result += branch.first.size() + sizeof(branch.second);
+            }
+            return result;
+        }
+
+        server_cache_eviction_rank eviction_rank(uint64_t now) const {
+            double weight = unowned_retained ? usage.weight(3, now) : 0;
+            if (unowned_retained && unowned_interactive) weight = std::max(weight, usage.weight(0, now));
+            if (unowned_ephemeral) weight = std::max(weight, usage.weight(5, now));
+            if (unowned_ephemeral && unowned_ephemeral_interactive) weight = std::max(weight, usage.weight(4, now));
+            // An old interactive hint is not refreshed by a background access.
+            // Shared pages take the strongest currently useful ownership claim.
+            for (const auto & branch : branches) {
+                weight = std::max(weight, usage.weight(hint_index(branch.second.first, branch.second.second, true), now));
+            }
+            return {weight, p1_tokens - p0_tokens, stored_size(), usage.last_access_ms};
+        }
+
+        bool backed() const {
+            return data_tgt.backed() && (data_dft.empty() || data_dft.backed()) &&
+                (data_tgt_reference.empty() || data_tgt_reference.backed());
+        }
+        size_t stored_size() const {
+            return size() - data_tgt.resident_size() - data_dft.resident_size() - data_tgt_reference.resident_size() +
+                data_tgt.size() + data_dft.size() + data_tgt_reference.size();
+        }
+        size_t size() const {
+            return sizeof(usage) + sizeof(release_after_ms) + sizeof(superseded_at_ms) + superseded_by.size() + key.size() + parent_key.size() + data_tgt.resident_size() + data_tgt_reference.resident_size() +
+                data_dft.resident_size() + policy_size();
+        }
+    };
+
+    using page_list = std::list<page>;
+
+    page_list::iterator eviction_candidate(const std::unordered_set<std::string> & ancestors, uint64_t now) {
+        auto leaf = pages.end();
+        for (auto it = pages.begin(); it != pages.end(); ++it) {
+            if ((ram_store.disk_store() && ram_store.disk_store()->pending(it->key)) ||
+                    it->children || ancestors.count(it->key) || it->release_after_ms > now ||
+                    response_leases.protects(it->key, now)) continue;
+            if (leaf == pages.end() || it->eviction_rank(now).less_than(leaf->eviction_rank(now))) leaf = it;
+        }
+        return leaf;
+    }
+
+
+    // A larger sibling is not necessarily an extension. Verify its exact
+    // shorter prefix while tokens are available, after state publication.
+    void note_superseded(const server_tokens & tokens, const std::string & replacement, uint64_t now) {
+        for (auto & node : pages) {
+            if (node.coarse || node.children || node.p1_tokens >= tokens.size() ||
+                    tokens.size() - node.p1_tokens <= 1 || !tokens.complete_boundary(node.p1_tokens)) continue;
+            if (node.superseded_at_ms && by_key.count(node.superseded_by)) continue;
+            if (tokens.cache_prefix_hash(node.p1_tokens) != node.key) continue;
+            const size_t extra = replacement.size() > node.superseded_by.size()
+                ? replacement.size() - node.superseded_by.size() : 0;
+            if (extra > limit_size - size_cur) continue;
+            size_cur -= node.superseded_by.size();
+            node.descriptor_dirty = true;
+            node.superseded_by = replacement;
+            size_cur += node.superseded_by.size();
+            if (!node.superseded_at_ms) node.superseded_at_ms = now;
+        }
+    }
+
+    size_t prune_superseded(const std::unordered_set<std::string> & protected_keys, uint64_t now) {
+        size_t removed = 0;
+        for (auto it = pages.begin(); it != pages.end();) {
+            auto node = it++;
+            const auto stamp = std::max(node->superseded_at_ms, node->usage.last_access_ms);
+            if ((ram_store.disk_store() && ram_store.disk_store()->pending(node->key)) ||
+                    !node->superseded_at_ms || node->coarse || node->children ||
+                    now < stamp || now - stamp < 1800000 || protected_keys.count(node->key) ||
+                    node->release_after_ms > now || response_leases.protects(node->key, now)) continue;
+            const auto replacement = by_key.find(node->superseded_by);
+            if (replacement == by_key.end() || replacement->second->p1_tokens <= node->p1_tokens + 1) continue;
+            // Explicitly retained periodic warmers must keep their pre-logits
+            // endpoints even if another request extends the base prompt.
+            bool warmer = false;
+            for (const auto & branch : node->branches) {
+                warmer |= branch.second.first == server_cache_priority::background &&
+                    branch.second.second == server_cache_lifecycle::retained;
+            }
+            if (warmer) continue;
+            evict(node, true, "superseded_partial");
+            stats_cur.superseded_pruned++;
+            removed++;
+        }
+        if (removed) persist();
+        return removed;
+    }
+
+    bool demote_ram() {
+#if defined(__linux__)
+        auto * disk = ram_store.disk_store();
+        if (!disk || !disk->active()) return false;
+        auto selected = pages.end();
+        const auto now = server_cache_now_ms();
+        // Prefer unleased pages, but disk-backed lease pages remain valid when
+        // RAM capacity requires their demotion; only logical deletion is fenced.
+        for (bool include_leased : {false, true}) {
+            for (auto it = pages.begin(); it != pages.end(); ++it) {
+                const size_t bytes = it->data_tgt.resident_size() + it->data_dft.resident_size() + it->data_tgt_reference.resident_size();
+                if (!bytes || !it->backed() || (!include_leased && response_leases.protects(it->key, now))) continue;
+                if (selected == pages.end() || it->eviction_rank(now).less_than(selected->eviction_rank(now))) selected = it;
+            }
+            if (selected != pages.end()) break;
+        }
+        if (selected == pages.end()) return false;
+        selected->descriptor_dirty = true;
+        const auto before = selected->size();
+        const auto target = selected->data_tgt.resident_size() + selected->data_tgt_reference.resident_size();
+        const auto draft = selected->data_dft.resident_size();
+        try {
+            for (const auto * part : {&selected->data_tgt, &selected->data_dft, &selected->data_tgt_reference}) {
+                if (part->empty()) continue;
+                struct stat st{};
+                const auto file = disk->path(part->metadata().at("file").get<std::string>());
+                if (lstat(file.c_str(), &st) || !S_ISREG(st.st_mode) || uint64_t(st.st_size) != part->size())
+                    throw std::runtime_error("SSD backup disappeared");
+            }
+            for (auto * part : {&selected->data_tgt, &selected->data_dft, &selected->data_tgt_reference}) {
+                if (!part->empty() && !part->on_disk()) part->demote(disk->path(part->metadata().at("file").get<std::string>()));
+            }
+        } catch (...) {
+            for (auto * part : {&selected->data_tgt, &selected->data_dft, &selected->data_tgt_reference}) part->forget_backup();
+            return false;
+        }
+        size_cur -= before - selected->size(); size_tgt_cur -= target; size_dft_cur -= draft;
+        stats_cur.ram_demotions++; return true;
+
+#else
+        return false;
+#endif
+    }
+
+    void maintain_ssd(const std::unordered_set<std::string> & protected_keys) {
+        auto * disk = ram_store.disk_store();
+        if (!disk || !disk->active()) return;
+        stats_cur.ssd_maintenance_runs++;
+        bool changed = false;
+        for (const auto & complete : disk->poll()) {
+            const auto found = by_key.find(complete.key);
+            if (found == by_key.end()) continue;
+            if (!complete.success) { found->second->ssd_retry_after_ms = server_cache_now_ms() + 60000; continue; }
+            found->second->descriptor_dirty = true;
+            for (auto * part : {&found->second->data_tgt, &found->second->data_dft, &found->second->data_tgt_reference}) part->mark_backed();
+            changed = true;
+        }
+        // Do not spend SSD bandwidth archiving tails already known obsolete.
+        changed |= prune_superseded(protected_keys, server_cache_now_ms()) > 0;
+        std::vector<std::pair<size_t, std::string>> ordered;
+        for (const auto & node : pages) ordered.emplace_back(node.p1_tokens, node.key);
+        std::sort(ordered.begin(), ordered.end()); // Parent backups precede their children.
+        for (const auto & entry : ordered) {
+            const auto found = by_key.find(entry.second);
+            if (found == by_key.end()) continue;
+            auto & node = *found->second;
+            if (node.backed() || disk->pending(node.key) || node.ssd_retry_after_ms > server_cache_now_ms()) continue;
+            ram_json parts = ram_json::array(); uint64_t bytes = 0;
+            for (const auto * part : {&node.data_tgt, &node.data_dft, &node.data_tgt_reference}) {
+                if (part->empty() || part->backed()) continue;
+                auto descriptor = part->metadata(); parts.push_back(descriptor);
+                if (!std::filesystem::exists(disk->path(descriptor.at("file").get<std::string>()))) bytes += part->size();
+            }
+            if (!disk->queue_space(bytes) || !disk->free_bytes()) break;
+            if (!disk->can_fit(bytes)) disk->reclaim_dormant(bytes);
+            while (!disk->can_fit(bytes)) {
+                auto victims_protected = protected_keys; victims_protected.insert(node.key);
+                auto victim = pages.end();
+                // Only deletion with an actual backing object frees SSD budget.
+                // Pick directly from disk-backed graph-safe leaves.
+                for (auto it = pages.begin(); it != pages.end(); ++it) {
+                    if (!it->backed() || it->children || victims_protected.count(it->key) || disk->pending(it->key) ||
+                            it->release_after_ms > server_cache_now_ms() || response_leases.protects(it->key, server_cache_now_ms())) continue;
+                    if (victim == pages.end() || it->eviction_rank(server_cache_now_ms()).less_than(victim->eviction_rank(server_cache_now_ms()))) victim = it;
+                }
+                if (victim == pages.end()) break;
+                evict(victim, true, "ssd_pressure"); persist(); changed = true;
+            }
+            if (!disk->can_fit(bytes)) break;
+            if (!disk->submit(node.key, ram_store.ram_directory(), parts)) break;
+        }
+        while (size_cur > limit_size - limit_size / 10 && demote_ram()) changed = true;
+        if (changed) persist();
+    }
+
+    struct chain_match {
+        std::vector<std::string> keys;
+        size_t tokens = 0;
+    };
+
+    void mark_control(page & node, const server_cache_control & control) {
+        size_t extra = 0;
+        if (!control.branch.empty() && node.branches.find(control.branch) == node.branches.end()) {
+            extra = control.branch.size() + sizeof(std::pair<server_cache_priority, server_cache_lifecycle>);
+        }
+        if (extra > limit_size - size_cur) {
+            SRV_WRN("%s", "range-state branch metadata exceeds cache limit, ignoring retention hint\n");
+            return;
+        }
+        node.record_control(control, true);
+        size_cur += extra;
+    }
+
+    void touch_chain(const std::vector<std::string> & chain, const server_cache_control & control) {
+        if (control.lifecycle == server_cache_lifecycle::one_shot) return;
+        for (const auto & key : chain) {
+            const auto found = by_key.find(key);
+            if (found == by_key.end()) continue;
+            mark_control(*found->second, control);
+            pages.splice(pages.end(), pages, found->second);
+        }
+    }
+
+    chain_match find_longest_chain(
+            const server_tokens & tokens, const llama_context * ctx_dft, size_t max_tokens = SIZE_MAX) const {
+        for (auto endpoint = endpoint_counts.rbegin(); endpoint != endpoint_counts.rend(); ++endpoint) {
+            if (endpoint->first > tokens.size() || endpoint->first > max_tokens ||
+                    !tokens.complete_boundary(endpoint->first)) {
+                continue;
+            }
+
+            const std::string leaf_key = tokens.cache_prefix_hash(endpoint->first);
+            auto current = by_key.find(leaf_key);
+            if (current == by_key.end() ||
+                    current->second->p1_tokens != endpoint->first ||
+                    current->second->p1_pos != tokens.pos_next(endpoint->first)) {
+                continue;
+            }
+
+            chain_match result;
+            std::unordered_set<std::string> seen;
+            while (current != by_key.end() && seen.insert(current->first).second) {
+                const page & node = *current->second;
+                if ((ctx_dft != nullptr) != !node.data_dft.empty()) {
+                    result.keys.clear();
+                    break;
+                }
+                if (tokens.cache_prefix_hash(node.p1_tokens) != node.key) {
+                    result.keys.clear();
+                    break;
+                }
+                result.keys.push_back(node.key);
+                if (node.p0_tokens == 0 && node.p0_pos == 0 && node.parent_key.empty()) {
+                    std::reverse(result.keys.begin(), result.keys.end());
+                    result.tokens = endpoint->first;
+                    return result;
+                }
+                if (node.parent_key.empty()) {
+                    result.keys.clear();
+                    break;
+                }
+                const auto parent = by_key.find(node.parent_key);
+                if (parent == by_key.end() ||
+                        parent->second->p1_tokens != node.p0_tokens ||
+                        parent->second->p1_pos != node.p0_pos) {
+                    result.keys.clear();
+                    break;
+                }
+                current = parent;
+            }
+        }
+        return {};
+    }
+
+    server_tokens::page_boundary capture_begin(
+            const server_tokens & tokens, const llama_context * ctx_dft,
+            const server_tokens::page_boundary & nominal) const {
+        if (!nominal.token_count) return nominal;
+        const auto parent = by_key.find(tokens.cache_prefix_hash(nominal.token_count));
+        if (parent != by_key.end() && parent->second->p1_tokens == nominal.token_count &&
+                parent->second->p1_pos == nominal.position &&
+                (ctx_dft != nullptr) == !parent->second->data_dft.empty()) {
+            return nominal;
+        }
+        // Live-prefix reuse can skip coarse captures. Its current tail is still
+        // capturable: attach a wider range to a rooted matching older endpoint,
+        // or capture from zero if no compatible ancestor survives the budget.
+        const auto match = find_longest_chain(tokens, ctx_dft, nominal.token_count);
+        return {match.tokens, tokens.pos_next(match.tokens)};
+    }
+
+    static bool verify_restore_enabled() {
+        static const bool enabled = []() {
+            const char * value = getenv("LLAMA_SERVER_PAGE_CACHE_VERIFY_RESTORE");
+            return value && atoi(value) > 0;
+        }();
+        return enabled;
+    }
+
+    bool capture_state(
+            llama_context * ctx,
+             llama_seq_id   seq_id,
+                   size_t   p0,
+                   size_t   p1,
+            server_page_bytes & data) {
+        const size_t size = llama_state_seq_get_size_range_ext(ctx, seq_id, p0, p1, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (size == 0) {
+            return false;
+        }
+        auto phase_start = ggml_time_us();
+        try {
+            ram_store.allocate(data, size);
+        } catch (const std::exception &) { return false; }
+        stats_cur.capture_alloc_us += ggml_time_us() - phase_start;
+        phase_start = ggml_time_us();
+        if (ctx) llama_synchronize(ctx);
+        stats_cur.capture_sync_us += ggml_time_us() - phase_start;
+        phase_start = ggml_time_us();
+        const bool ok = llama_state_seq_get_data_range_ext(
+                ctx, data.data(), data.size(), seq_id, p0, p1, LLAMA_STATE_SEQ_FLAGS_NONE) == size;
+        stats_cur.capture_copy_us += ggml_time_us() - phase_start;
+        phase_start = ggml_time_us();
+        if (ok && ram_store.active()) { data.seal(); }
+        stats_cur.capture_seal_us += ggml_time_us() - phase_start;
+        return ok;
+    }
+
+    bool capture_full_state(llama_context * ctx, llama_seq_id seq_id, server_page_bytes & data) {
+        const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (!size) return false;
+        try { ram_store.allocate(data, size); } catch (const std::exception &) { return false; }
+        const bool ok = llama_state_seq_get_data_ext(ctx, data.data(), size, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == size;
+        if (ok && ram_store.active()) { data.seal(); }
+        return ok;
+    }
+
+    static bool capture_full_state(
+            llama_context * ctx,
+             llama_seq_id   seq_id,
+            std::vector<uint8_t> & data) {
+        const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (size == 0) {
+            return false;
+        }
+        try {
+            data.resize(size);
+        } catch (const std::bad_alloc &) {
+            return false;
+        }
+        return llama_state_seq_get_data_ext(
+                ctx, data.data(), data.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == size;
+    }
+
+    static bool restore_state(llama_context * ctx, llama_seq_id seq_id, const server_page_bytes & data) {
+        try {
+            const bool ok = llama_state_seq_set_data_ext(ctx, data.data(), data.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == data.size();
+            data.release_disk_mapping(); return ok;
+        } catch (...) { data.release_disk_mapping(); return false; }
+    }
+
+    static bool clear_sequence(llama_context * ctx, llama_seq_id seq_id) {
+        return ctx == nullptr || llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+    }
+
+    void record_capture(int64_t t_start) {
+        stats_cur.capture_last_us = uint64_t(ggml_time_us() - t_start);
+        stats_cur.capture_us += stats_cur.capture_last_us;
+        stats_cur.capture_attempts++;
+    }
+
+    void record_restore(int64_t t_start) {
+        stats_cur.restore_last_us = uint64_t(ggml_time_us() - t_start);
+        stats_cur.restore_us += stats_cur.restore_last_us;
+        stats_cur.restore_attempts++;
+    }
+
+    void evict(page_list::iterator it, bool count_eviction = true, const char * reason = "pressure") {
+        if (count_eviction) {
+            const auto now = server_cache_now_ms();
+            ram_json branches = ram_json::array();
+            for (const auto & branch : it->branches) branches.push_back(branch.first);
+            eviction_history.push_back({{"at_ms", now}, {"reason", reason}, {"key", it->key},
+                {"p0_tokens", it->p0_tokens}, {"p1_tokens", it->p1_tokens}, {"coarse", it->coarse},
+                {"bytes", it->stored_size()}, {"ram_bytes", it->size()}, {"last_access_ms", it->usage.last_access_ms},
+                {"retrievals", it->usage.retrievals}, {"weight", it->eviction_rank(now).weight},
+                {"branches", branches}, {"superseded_by", it->superseded_by}});
+            if (eviction_history.size() > 64) eviction_history.erase(eviction_history.begin());
+        }
+        GGML_ASSERT(it->children == 0);
+        response_leases.invalidate(it->key, server_cache_now_ms());
+        if (!it->parent_key.empty()) {
+            const auto parent = by_key.find(it->parent_key);
+            if (parent != by_key.end()) {
+                GGML_ASSERT(parent->second->children > 0);
+                parent->second->children--;
+            }
+        }
+        const auto endpoint = endpoint_counts.find(it->p1_tokens);
+        GGML_ASSERT(endpoint != endpoint_counts.end() && endpoint->second > 0);
+        if (--endpoint->second == 0) {
+            endpoint_counts.erase(endpoint);
+        }
+        size_cur -= it->size();
+        size_tgt_cur -= it->data_tgt.resident_size() + it->data_tgt_reference.resident_size();
+        size_dft_cur -= it->data_dft.resident_size();
+        by_key.erase(it->key);
+        pages.erase(it);
+        if (count_eviction) {
+            stats_cur.evictions++;
+        }
+    }
+
+    void evict_graph(const std::string & key, bool count_eviction) {
+        std::vector<std::string> children;
+        for (const auto & item : pages) {
+            if (item.parent_key == key) {
+                children.push_back(item.key);
+            }
+        }
+        for (const auto & child : children) {
+            evict_graph(child, count_eviction);
+        }
+        const auto found = by_key.find(key);
+        if (found != by_key.end()) {
+            evict(found->second, count_eviction);
+        }
+    }
+
+    template<typename Operation> bool mutate_lease(Operation operation) {
+        const auto previous = response_leases.snapshot();
+        if (!operation()) return false;
+        if (persist()) return true;
+        server_responses_leases::page_sizes available;
+        for (const auto & node : pages) available.emplace(node.key,
+            node.data_tgt.size() + node.data_dft.size() + node.data_tgt_reference.size());
+        response_leases.restore(previous, available, server_cache_now_ms());
+        persist();
+        return false; // never acknowledge a lease publication whose manifest failed
+    }
+
+    using ram_json = server_page_ram_store::json;
+
+    bool persist() {
+        if (!ram_store.active()) return true;
+        const auto started = ggml_time_us();
+        stats_cur.persist_attempts++;
+        ram_json graph = ram_json::array();
+        for (auto & node : pages) {
+            if (node.descriptor_dirty) {
+                ram_json branches = ram_json::array();
+                for (const auto & branch : node.branches) branches.push_back({branch.first, int(branch.second.first), int(branch.second.second)});
+                node.descriptor = {{"key", node.key}, {"parent", node.parent_key},
+                    {"p0_tokens", node.p0_tokens}, {"p1_tokens", node.p1_tokens}, {"p0_pos", node.p0_pos}, {"p1_pos", node.p1_pos},
+                    {"coarse", node.coarse}, {"unowned_retained", node.unowned_retained}, {"unowned_interactive", node.unowned_interactive},
+                    {"unowned_ephemeral", node.unowned_ephemeral}, {"unowned_ephemeral_interactive", node.unowned_ephemeral_interactive},
+                    {"branches", branches}, {"page_tokens", page_tokens},
+                    {"release_after_ms", node.release_after_ms}, {"last_access_ms", node.usage.last_access_ms}, {"retrievals", node.usage.retrievals},
+                    {"hint_ms", node.usage.hint_ms},
+                    {"superseded_at_ms", node.superseded_at_ms}, {"superseded_by", node.superseded_by},
+                    {"eviction_metadata_bytes", node.size() - node.data_tgt.resident_size() - node.data_dft.resident_size() - node.data_tgt_reference.resident_size()},
+                    {"target", node.data_tgt.metadata()}, {"draft", node.data_dft.metadata()}, {"reference", node.data_tgt_reference.metadata()}};
+                node.descriptor_dirty = false;
+                stats_cur.manifest_node_builds++;
+            } else {
+                stats_cur.manifest_node_reuses++;
+            }
+            graph.push_back(node.descriptor);
+        }
+        ram_json leases = ram_json::array();
+        for (const auto & entry : response_leases.snapshot()) {
+            const auto & state = entry.second;
+            const auto & pending = state.pending;
+            leases.push_back({{"scope", entry.first}, {"head", state.head}, {"generation", state.generation},
+                {"expires", state.expires}, {"touched", state.touched}, {"pages", state.pages},
+                {"pending", {{"revision", pending.revision}, {"generation", pending.generation},
+                    {"expires", pending.expires}, {"pages", pending.pages}, {"complete", pending.endpoint_complete}}}});
+        }
+        const auto built = ggml_time_us();
+        const bool ok = ram_store.write(std::move(graph), {{"response_leases", leases}, {"eviction_history", eviction_history}, {"tiers", server_page_ram_store::json::parse(tier_stats().dump())}});
+        const auto finished = ggml_time_us();
+        stats_cur.persist_build_us += built - started;
+        stats_cur.persist_write_us += finished - built;
+        stats_cur.persist_us += finished - started;
+        return ok;
+    }
+
+    void recover() {
+        if (!ram_store.active()) return;
+        const auto graph = ram_store.read();
+        const auto history = ram_store.metadata().value("eviction_history", ram_json::array());
+        if (history.is_array()) {
+            for (size_t i = history.size() > 64 ? history.size() - 64 : 0; i < history.size(); ++i) {
+                if (history[i].is_object()) eviction_history.push_back(history[i]);
+            }
+        }
+        if (!graph.is_array()) { ram_store.rejected++; persist(); return; }
+        // Manifest order is LRU, not topology. Load parents before their descendants.
+        std::unordered_map<std::string, size_t> lru_order;
+        for (size_t i = 0; i < graph.size(); ++i) {
+            if (graph[i].contains("key") && graph[i]["key"].is_string()) lru_order.emplace(graph[i]["key"].get<std::string>(), i);
+        }
+        std::vector<ram_json> pending(graph.begin(), graph.end());
+        std::stable_sort(pending.begin(), pending.end(), [](const ram_json & a, const ram_json & b) {
+            const auto endpoint = [](const ram_json & value) {
+                try { return value.at("p1_tokens").get<size_t>(); } catch (...) { return SIZE_MAX; }
+            };
+            return endpoint(a) < endpoint(b);
+        });
+        for (const auto & entry : pending) {
+            try {
+                page node;
+                node.key = entry.at("key").get<std::string>(); node.parent_key = entry.at("parent").get<std::string>();
+                node.p0_tokens = entry.at("p0_tokens"); node.p1_tokens = entry.at("p1_tokens");
+                node.p0_pos = entry.at("p0_pos"); node.p1_pos = entry.at("p1_pos");
+                const uint64_t now = server_cache_now_ms();
+                const auto unsigned_value = [](const ram_json & value) -> uint64_t {
+                    if (value.is_number_unsigned()) return value.get<uint64_t>();
+                    if (value.is_number_integer() && value.get<int64_t>() >= 0) return uint64_t(value.get<int64_t>());
+                    return 0;
+                };
+                // Invalid optional policy history must neither fabricate activity
+                // nor reject otherwise valid, checksum-verified model state.
+                node.release_after_ms = std::min(unsigned_value(entry.value("release_after_ms", ram_json())), now + 30000);
+                node.usage.last_access_ms = std::min(unsigned_value(entry.value("last_access_ms", ram_json())), now);
+                node.superseded_at_ms = std::min(unsigned_value(entry.value("superseded_at_ms", ram_json())), now);
+                if (entry.contains("superseded_by") && entry["superseded_by"].is_string() &&
+                        entry["superseded_by"].get<std::string>().size() == 64) {
+                    node.superseded_by = entry["superseded_by"].get<std::string>();
+                } else { node.superseded_at_ms = 0; }
+                node.usage.retrievals = uint32_t(std::min<uint64_t>(unsigned_value(entry.value("retrievals", ram_json())), 15));
+                if (entry.contains("hint_ms") && entry.at("hint_ms").is_array() && entry.at("hint_ms").size() == 6) {
+                    for (size_t i = 0; i < 6; ++i) node.usage.hint_ms[i] = std::min(unsigned_value(entry.at("hint_ms")[i]), now);
+                }
+                node.coarse = entry.at("coarse"); node.unowned_retained = entry.at("unowned_retained");
+                node.unowned_interactive = entry.at("unowned_interactive");
+                node.unowned_ephemeral = entry.contains("unowned_ephemeral") && entry.at("unowned_ephemeral").is_boolean() && entry.at("unowned_ephemeral").get<bool>();
+                node.unowned_ephemeral_interactive = entry.contains("unowned_ephemeral_interactive") && entry.at("unowned_ephemeral_interactive").is_boolean() && entry.at("unowned_ephemeral_interactive").get<bool>();
+                if (entry.at("page_tokens") != page_tokens || node.key.empty() || by_key.count(node.key) ||
+                    node.p1_tokens <= node.p0_tokens || node.p1_pos <= node.p0_pos || node.p0_pos < 0)
+                    throw std::runtime_error("invalid RAM page coordinates");
+                const auto parent = by_key.find(node.parent_key);
+                if (node.parent_key.empty() ? (node.p0_tokens != 0 || node.p0_pos != 0) :
+                    (parent == by_key.end() || parent->second->p1_tokens != node.p0_tokens || parent->second->p1_pos != node.p0_pos))
+                    throw std::runtime_error("incomplete RAM page chain");
+                for (const auto & branch : entry.at("branches")) {
+                    const auto priority = branch.at(1).get<int>(); const auto lifecycle = branch.at(2).get<int>();
+                    if (priority < 0 || priority > 1 || lifecycle < 0 || lifecycle > 2) throw std::runtime_error("invalid RAM policy");
+                    node.branches.emplace(branch.at(0).get<std::string>(), std::make_pair(server_cache_priority(priority), server_cache_lifecycle(lifecycle)));
+                }
+                if (node.size() > limit_size - size_cur) throw std::runtime_error("RAM metadata exceeds limit");
+                size_t budget = limit_size - size_cur - node.size();
+                ram_store.load(node.data_tgt, entry.at("target"), budget);
+                ram_store.load(node.data_dft, entry.at("draft"), budget);
+                ram_store.load(node.data_tgt_reference, entry.at("reference"), budget);
+                if (node.data_tgt.empty()) throw std::runtime_error("empty RAM target state");
+                size_cur += node.size(); size_tgt_cur += node.data_tgt.resident_size() + node.data_tgt_reference.resident_size(); size_dft_cur += node.data_dft.resident_size();
+                if (parent != by_key.end()) parent->second->children++;
+                endpoint_counts[node.p1_tokens]++;
+                pages.push_back(std::move(node)); by_key.emplace(pages.back().key, std::prev(pages.end())); ram_store.recovered++;
+            } catch (const std::exception &) { ram_store.rejected++; }
+        }
+        try {
+            std::map<std::string, server_responses_leases::scope> recovered;
+            for (const auto & entry : ram_store.metadata().value("response_leases", ram_json::array())) {
+                server_responses_leases::scope state;
+                state.head = entry.at("head").get<std::string>();
+                state.generation = entry.at("generation").get<uint64_t>();
+                state.expires = entry.at("expires").get<uint64_t>();
+                state.touched = entry.at("touched").get<uint64_t>();
+                state.pages = entry.at("pages").get<server_responses_leases::page_sizes>();
+                const auto & pending = entry.at("pending");
+                state.pending.revision = pending.at("revision").get<std::string>();
+                state.pending.generation = pending.at("generation").get<uint64_t>();
+                state.pending.expires = pending.at("expires").get<uint64_t>();
+                state.pending.pages = pending.at("pages").get<server_responses_leases::page_sizes>();
+                state.pending.endpoint_complete = pending.at("complete").get<bool>();
+                if (!recovered.emplace(entry.at("scope").get<std::string>(), std::move(state)).second)
+                    throw std::runtime_error("duplicate recovered response scope");
+            }
+            server_responses_leases::page_sizes available;
+            for (const auto & node : pages) available.emplace(node.key,
+                node.data_tgt.size() + node.data_dft.size() + node.data_tgt_reference.size());
+            if (!response_leases.restore(std::move(recovered), available, server_cache_now_ms())) ram_store.rejected++;
+        } catch (const std::exception &) { ram_store.rejected++; }
+        // Loading topology must not turn old parents into recent cache entries.
+        pages.sort([&](const page & a, const page & b) { return lru_order.at(a.key) < lru_order.at(b.key); });
+        persist();
+    }
+
+    size_t limit_size;
+    size_t page_tokens;
+    size_t size_cur = 0;
+    size_t size_tgt_cur = 0;
+    size_t size_dft_cur = 0;
+    page_list pages;
+    std::unordered_map<std::string, page_list::iterator> by_key;
+    std::map<size_t, size_t> endpoint_counts;
+    counters stats_cur;
+    uint64_t next_ssd_maintenance_ms = 0;
+    ram_json eviction_history = ram_json::array();
+    server_page_ram_store ram_store;
+    server_responses_leases response_leases{limit_size / 2};
+};
+
 struct server_slot {
     int id;
 
@@ -289,6 +1829,8 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+
+    std::vector<server_tokens::page_boundary> prompt_page_boundaries;
 
     llama_tokens spec_draft;
 
@@ -361,16 +1903,51 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
+        prompt_cache.save_shared(*cur);
+
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        prompt.tokens.has_mtmd = mctx != nullptr;
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
         return res;
+    }
+
+    void prompt_save_shared() const {
+        if (!server_shared_prompt_cache_enabled() || prompt.tokens.empty()) {
+            return;
+        }
+
+        server_prompt_cache_state state {
+            /*.prompt =*/ prompt.clone(),
+            /*.data   =*/ {},
+        };
+        const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        try {
+            state.data.main.resize(size_tgt);
+            state.data.drft.resize(size_dft);
+        } catch (const std::bad_alloc & e) {
+            SLT_ERR(*this, "failed to allocate shared prompt state: %s\n", e.what());
+            return;
+        }
+        llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        server_shared_prompt_cache_save(state);
+    }
+
+    bool prompt_load_shared(const server_tokens & tokens) {
+        bool failed_restore = false;
+        server_shared_prompt_cache_load(prompt, tokens, ctx_tgt, ctx_dft, id, &failed_restore);
+        prompt.tokens.has_mtmd = mctx != nullptr;
+        return !failed_restore;
     }
 
     void prompt_clear() {
@@ -433,6 +2010,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        prompt_page_boundaries.clear();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -526,9 +2104,19 @@ struct server_slot {
             return false;
         }
 
-        return task->type == other_slot.task->type
-            && inp_embd.size() == other_slot.inp_embd.size()
-            && are_lora_equal(lora, other_slot.lora);
+        if (task->type != other_slot.task->type ||
+            inp_embd.size() != other_slot.inp_embd.size() ||
+            can_speculate() != other_slot.can_speculate() ||
+            !are_lora_equal(lora, other_slot.lora)) {
+            return false;
+        }
+        if (task->type == SERVER_TASK_TYPE_HIDDEN_STATE) {
+            // The context exposes one row-major capture buffer per layer, with
+            // no sequence-to-row map. Keep extraction requests isolated so a
+            // slot can never consume another slot's rows.
+            return false;
+        }
+        return true;
     }
 
     // returns -1 if the generation is limitless
@@ -1013,6 +2601,7 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
+    server_responses_registry & request_registry() { return response_registry; } // CPU-only, safe while sleeping
     bool has_cap_tts() const {
         return mctx != nullptr && mtmd_gen_audio_get_info(mctx).type != MTMD_GEN_AUDIO_TYPE_NONE;
     }
@@ -1051,11 +2640,125 @@ public:
         metrics.reset_bucket();
     }
 
+    json probe_prompt_cache(const server_tokens & tokens_new) const {
+        json slots_json = json::array();
+        int32_t best_slot_id = -1;
+        int32_t best_common_prefix_tokens = 0;
+        int32_t best_cached_tokens = 0;
+        int32_t busy_slots = 0;
+        int64_t cached_tokens_total = 0;
+
+        for (const server_slot & slot : slots) {
+            const bool busy = slot.is_processing();
+            if (busy) {
+                busy_slots++;
+            }
+
+            const int32_t cached_tokens = (int32_t) slot.prompt.tokens.size();
+            const int32_t common_prefix_tokens = cached_tokens > 0
+                ? slot.prompt.tokens.get_common_prefix(tokens_new)
+                : 0;
+            cached_tokens_total += cached_tokens;
+
+            if (!busy && common_prefix_tokens > best_common_prefix_tokens) {
+                best_slot_id = slot.id;
+                best_common_prefix_tokens = common_prefix_tokens;
+                best_cached_tokens = cached_tokens;
+            }
+
+            const char * state = "unknown";
+            switch (slot.state) {
+                case SLOT_STATE_IDLE:              state = "idle";              break;
+                case SLOT_STATE_WAIT_OTHER:        state = "wait_other";        break;
+                case SLOT_STATE_STARTED:           state = "started";           break;
+                case SLOT_STATE_PROCESSING_PROMPT: state = "processing_prompt"; break;
+                case SLOT_STATE_DONE_PROMPT:       state = "done_prompt";       break;
+                case SLOT_STATE_GENERATING:        state = "generating";        break;
+                default: break;
+            }
+
+            slots_json.push_back(json {
+                {"id_slot", slot.id},
+                {"state", state},
+                {"busy", busy},
+                {"cached_tokens", cached_tokens},
+                {"common_prefix_tokens", common_prefix_tokens},
+                {"prompt_match_fraction", tokens_new.empty() ? 0.0 : double(common_prefix_tokens) / double(tokens_new.size())},
+                {"slot_keep_fraction", cached_tokens == 0 ? 0.0 : double(common_prefix_tokens) / double(cached_tokens)},
+                {"last_used_us", slot.t_last_used},
+            });
+        }
+
+        json page_cache_json = {
+            {"enabled", prompt_page_cache != nullptr},
+        };
+        if (prompt_page_cache) {
+            const auto & page_stats = prompt_page_cache->stats();
+            page_cache_json["replacement_policy"] = prompt_page_cache->replacement_stats();
+            page_cache_json["page_tokens"]    = prompt_page_cache->page_size_tokens();
+            page_cache_json["matched_tokens"] = prompt_page_cache->match_tokens(tokens_new);
+            page_cache_json["entries"]        = prompt_page_cache->count();
+            page_cache_json["bytes"]          = prompt_page_cache->size();
+            page_cache_json["target_bytes"]   = prompt_page_cache->target_size();
+            page_cache_json["draft_bytes"]    = prompt_page_cache->draft_size();
+            page_cache_json["metadata_bytes"] = prompt_page_cache->metadata_size();
+            page_cache_json["limit_bytes"]    = prompt_page_cache->limit();
+            page_cache_json["persist_attempts"] = page_stats.persist_attempts;
+            page_cache_json["persist_us"] = page_stats.persist_us;
+            page_cache_json["manifest_node_builds"] = page_stats.manifest_node_builds;
+            page_cache_json["manifest_node_reuses"] = page_stats.manifest_node_reuses;
+            page_cache_json["persist_build_us"] = page_stats.persist_build_us;
+            page_cache_json["persist_write_us"] = page_stats.persist_write_us;
+            page_cache_json["capture_sync_us"] = page_stats.capture_sync_us;
+            page_cache_json["capture_alloc_us"] = page_stats.capture_alloc_us;
+            page_cache_json["capture_copy_us"] = page_stats.capture_copy_us;
+            page_cache_json["capture_seal_us"] = page_stats.capture_seal_us;
+            page_cache_json["capture_attempts"] = page_stats.capture_attempts;
+            page_cache_json["capture_us"]       = page_stats.capture_us;
+            page_cache_json["capture_last_us"]  = page_stats.capture_last_us;
+            page_cache_json["restore_attempts"] = page_stats.restore_attempts;
+            page_cache_json["restore_us"]       = page_stats.restore_us;
+            page_cache_json["restore_last_us"]  = page_stats.restore_last_us;
+            page_cache_json["captures"]       = page_stats.captures;
+            page_cache_json["capture_bridges"] = page_stats.capture_bridges;
+            page_cache_json["hits"]           = page_stats.hits;
+            page_cache_json["misses"]         = page_stats.misses;
+            page_cache_json["restored_tokens"] = page_stats.restored_tokens;
+            page_cache_json["evictions"]      = page_stats.evictions;
+            page_cache_json["failures"]       = page_stats.failures;
+            page_cache_json["verify_attempts"] = page_stats.verify_attempts;
+            page_cache_json["verify_failures"] = page_stats.verify_failures;
+            page_cache_json["branch_releases"] = page_stats.branch_releases;
+            page_cache_json["live_prefix_adoptions"] = page_stats.live_prefix_adoptions;
+            page_cache_json["persistence"] = prompt_page_cache->persistence_stats();
+        }
+
+        return {
+            {"input_tokens", (int32_t) tokens_new.size()},
+            {"best_slot_id", best_slot_id},
+            {"best_common_prefix_tokens", best_common_prefix_tokens},
+            {"best_cached_tokens", best_cached_tokens},
+            {"best_prompt_match_fraction", tokens_new.empty() ? 0.0 : double(best_common_prefix_tokens) / double(tokens_new.size())},
+            {"best_slot_keep_fraction", best_cached_tokens == 0 ? 0.0 : double(best_common_prefix_tokens) / double(best_cached_tokens)},
+            {"cached_tokens_total", cached_tokens_total},
+            {"cache_utilization", n_ctx <= 0 ? 0.0 : double(cached_tokens_total) / double(n_ctx)},
+            {"n_ctx", n_ctx},
+            {"slot_count", (int32_t) slots.size()},
+            {"busy_slots", busy_slots},
+            {"shared_prompt_cache_enabled", server_shared_prompt_cache_enabled()},
+            {"page_cache", std::move(page_cache_json)},
+            {"slots", slots_json},
+        };
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
 
     common_params params_base;
+
+    // Outlives both contexts, whose callbacks retain its role-specific userdata.
+    std::unique_ptr<common_moe_trace> moe_trace;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1091,7 +2794,9 @@ private:
 
     int n_empty_consecutive = 0;
 
-    std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_prompt_cache>      prompt_cache;
+    std::unique_ptr<server_prompt_page_cache> prompt_page_cache;
+    server_responses_registry response_registry;
 
     server_metrics metrics;
 
@@ -1128,6 +2833,7 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+        if (moe_trace) { moe_trace->finish("context_closed"); }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1189,12 +2895,26 @@ private:
 
         const bool is_resume = sleeping;
 
+        if (!is_resume) {
+            const char * trace_path = std::getenv("LLAMA_MOE_TRACE_FILE");
+            if (trace_path && *trace_path && params.cb_eval) {
+                throw std::runtime_error("route capture cannot replace an existing evaluation callback");
+            }
+            moe_trace = common_moe_trace::from_env(params.n_parallel);
+        }
+
         params_base = params;
+        if (moe_trace && moe_trace->routes_enabled()) {
+            params_base.cb_eval = common_moe_trace::callback;
+            params_base.cb_eval_user_data = moe_trace->callback_data(common_moe_trace_role::target);
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
+        const bool has_visiontower = !params.visiontower_url.empty();
+        const bool has_mtmd = has_mmproj || has_visiontower;
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
@@ -1223,7 +2943,7 @@ private:
 
         std::string & mmproj_path = params_base.mmproj.path;
         mtmd_context_params mparams = mtmd_context_params_default();
-        if (has_mmproj) {
+        if (has_mtmd) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.device           = params_base.mmproj_device;
             mparams.print_timings    = false;
@@ -1284,7 +3004,27 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        server_load_progress_watchdog load_watchdog;
+        load_watchdog.timeout_ms = server_load_watchdog_timeout_ms();
+        if (load_watchdog.timeout_ms > 0) {
+            load_watchdog.previous_callback = params_base.load_progress_callback;
+            load_watchdog.previous_user_data = params_base.load_progress_callback_user_data;
+            load_watchdog.model_path = params_base.model.path.c_str();
+            params_base.load_progress_callback = server_load_progress_watchdog::callback;
+            params_base.load_progress_callback_user_data = &load_watchdog;
+            SRV_INF("load progress watchdog enabled: %.3f s stall timeout\n", load_watchdog.timeout_ms / 1000.0);
+            load_watchdog.start();
+        }
+
         llama_init = common_init_from_params(params_base);
+
+        if (load_watchdog.timeout_ms > 0) {
+            load_watchdog.stop();
+            params_base.load_progress_callback = load_watchdog.previous_callback;
+            params_base.load_progress_callback_user_data = load_watchdog.previous_user_data;
+        }
+
+        params.sampling = params_base.sampling;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1309,6 +3049,10 @@ private:
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
+        if (moe_trace) {
+            moe_trace->metadata(llama_commit(), params_base.model.path, llm_arch_name(model_tgt->arch),
+                                model_tgt->hparams.n_expert, model_tgt->hparams.n_expert_used_max());
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1319,6 +3063,9 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+                if (moe_trace && moe_trace->routes_enabled()) {
+                    params_dft.cb_eval_user_data = moe_trace->callback_data(common_moe_trace_role::draft);
+                }
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1345,9 +3092,9 @@ private:
             load_progress_callback(1.0f, &load_progress_spec);
         }
 
-        if (has_mmproj) {
+        if (has_mtmd) {
             if (callback_state) {
-                callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
+                callback_state(SERVER_STATE_LOADING, {{"stage", has_mmproj ? "mmproj_model" : "visiontower_client"}});
             }
 
             if (!is_resume) {
@@ -1371,12 +3118,20 @@ private:
                 }
             }
 
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            mctx = has_mmproj
+                ? mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams)
+                : mtmd_init_from_text_model(model_tgt, mparams);
             if (mctx == nullptr) {
-                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                SRV_ERR("%s", "failed to initialize multimodal context\n");
                 return false;
             }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            if (has_mmproj) {
+                SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            }
+            mtmd_set_visiontower_url(mctx, params_base.visiontower_url.c_str());
+            if (has_visiontower) {
+                SRV_INF("configured external visiontower '%s'\n", params_base.visiontower_url.c_str());
+            }
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -1520,6 +3275,13 @@ private:
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
+                if (slot.task && !slot.task->params.response_scope.empty() && prompt_page_cache) {
+                    auto & mutable_slot = const_cast<server_slot &>(slot);
+                    capture_prompt_page(mutable_slot, true);
+                    prompt_page_cache->observe_lease(slot.task->params.response_scope, slot.task->params.response_revision,
+                        slot.task->params.cache_control.branch, slot.task->n_tokens(), slot.stats.n_gen > 0);
+                }
+                if (slot.task) response_registry.finish(slot.task->id);
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
@@ -1585,11 +3347,29 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        if (params_base.cache_page_ram_mib > 0) {
+            if (uint32_t(params_base.cache_page_tokens) > llama_n_ctx_seq(ctx_tgt)) {
+                SRV_WRN("--cache-page-tokens %d exceeds per-sequence context %u, disabling range-state page cache\n",
+                        params_base.cache_page_tokens, llama_n_ctx_seq(ctx_tgt));
+            } else {
+                prompt_page_cache = std::make_unique<server_prompt_page_cache>(
+                        size_t(params_base.cache_page_ram_mib) * 1024ull * 1024ull,
+                        size_t(params_base.cache_page_tokens));
+                SRV_TRC("range-state page cache enabled, page = %d tokens, limit = %d MiB\n",
+                        params_base.cache_page_tokens, params_base.cache_page_ram_mib);
+            }
+        } else {
+            SRV_TRC("%s", "range-state page cache disabled - use `--cache-page-ram N` to enable it\n");
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+        if (server_shared_prompt_cache_enabled()) {
+            SRV_WRN("%s", "shared prompt cache is enabled independently of local prompt cache\n");
         }
 
         if (!params_base.model_alias.empty()) {
@@ -1702,9 +3482,9 @@ private:
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
+                /* allow_image           */ mctx ? (mtmd_support_vision(mctx) || !params_base.visiontower_url.empty()) : false,
                 /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-                /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
+                /* allow_video           */ mctx ? (mtmd_helper_support_video(mctx) || !params_base.visiontower_url.empty()) : false,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -1851,23 +3631,36 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            const auto & tokens = ret->prompt.tokens;
 
-            // cache prompts only for the tasks that reuse them
-            update_cache = update_cache && !task.is_stateless();
+            // cache prompts only for completion tasks
+            update_cache = update_cache && !task.is_stateless() && task.type != SERVER_TASK_TYPE_HIDDEN_STATE;
+            update_cache = update_cache && (prompt_cache || server_shared_prompt_cache_enabled());
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // don't save the slot's state if its context is empty
+                if (tokens.size() > 0) {
+                    if (prompt_cache) {
+                        ret->prompt_save(*prompt_cache);
+                    } else {
+                        ret->prompt_save_shared();
+                    }
+                }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                const bool loaded_prompt = prompt_cache
+                    ? ret->prompt_load(*prompt_cache, task.tokens)
+                    : ret->prompt_load_shared(task.tokens);
+                if (!loaded_prompt) {
                     ret->prompt_clear();
                 }
 
-                prompt_cache->update();
+                if (prompt_cache) {
+                    prompt_cache->update();
+                }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -1921,7 +3714,115 @@ private:
         return output;
     }
 
+    bool prompt_page_cache_eligible(const server_slot & slot, const server_task & task) const {
+        return prompt_page_cache &&
+            task.type == SERVER_TASK_TYPE_COMPLETION &&
+            !task.is_parent() &&
+            !task.is_child() &&
+            lora_get_enabled_ids(slot.lora).empty() &&
+            task.tokens.has_stable_media_identity();
+    }
+
+    bool prompt_page_cache_boundary(const server_slot & slot) const {
+        if (!slot.task || !prompt_page_cache_eligible(slot, *slot.task)) {
+            return false;
+        }
+        const size_t n_tokens = slot.prompt.n_tokens();
+        const llama_pos position = slot.prompt.tokens.pos_next();
+        return std::any_of(
+                slot.prompt_page_boundaries.begin(), slot.prompt_page_boundaries.end(),
+                [&](const auto & boundary) {
+                    return boundary.token_count == n_tokens && boundary.position == position;
+                });
+    }
+
+    const server_tokens::page_boundary * next_prompt_page_boundary(const server_slot & slot) const {
+        const size_t n_tokens = slot.prompt.n_tokens();
+        for (const auto & boundary : slot.prompt_page_boundaries) {
+            if (boundary.token_count > n_tokens) {
+                return &boundary;
+            }
+        }
+        return nullptr;
+    }
+
+    bool capture_prompt_page(server_slot & slot, bool exact_endpoint = false) {
+        if (!slot.task || slot.task->params.cache_control.lifecycle == server_cache_lifecycle::one_shot ||
+                (!exact_endpoint && !prompt_page_cache_boundary(slot)) ||
+                !prompt_page_cache_eligible(slot, *slot.task) ||
+                slot.prompt.tokens.empty() || slot.prompt.tokens.pos_next() <= 0) {
+            return false;
+        }
+        llama_context * page_ctx_dft = slot.can_speculate() ? ctx_dft : nullptr;
+        if (!prompt_page_cache->capture(
+                    slot.prompt.tokens, ctx_tgt, page_ctx_dft, slot.id, slot.task->params.cache_control, exact_endpoint)) {
+            SLT_WRN(slot, "failed to capture range-state page ending at token %zu / position %d\n",
+                    slot.prompt.tokens.size(), slot.prompt.tokens.pos_next());
+            return false;
+        }
+        if (!slot.task->params.response_scope.empty()) {
+            prompt_page_cache->observe_lease(slot.task->params.response_scope, slot.task->params.response_revision,
+                slot.task->params.cache_control.branch, 0, false);
+        }
+        SLT_TRC(slot, "captured range-state page ending at token %zu / position %d, cache = %zu pages / %.3f MiB\n",
+                slot.prompt.tokens.size(), slot.prompt.tokens.pos_next(), prompt_page_cache->count(),
+                prompt_page_cache->size() / (1024.0 * 1024.0));
+        return true;
+    }
+
+    void restore_prompt_pages(server_slot & slot, const server_task & task) {
+        // Task token containers describe an individual request and plain-text
+        // tasks intentionally have MTMD disabled. The persistent slot instead
+        // inherits the server capability. Reassert it before every exit path,
+        // including a page-cache miss followed by a media continuation.
+        slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+        if (!prompt_page_cache_eligible(slot, task)) {
+            return;
+        }
+
+        const size_t current_lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+        // Hybrid/recurrent state can report that memory supports shifting
+        // while still rejecting truncation inside its recurrent endpoint.
+        // The later prompt-rewind guard would then discard the entire prefix.
+        const bool live_requires_rewind = current_lcp < slot.prompt.tokens.size() &&
+            (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt));
+        bool failed = false;
+        llama_context * page_ctx_dft = slot.can_speculate() ? ctx_dft : nullptr;
+        const size_t restored = prompt_page_cache->restore(
+                task.tokens, current_lcp, live_requires_rewind, ctx_tgt, page_ctx_dft,
+                slot.id, task.params.cache_control, failed);
+        if (failed) {
+            slot.prompt.clear();
+            SLT_WRN(slot, "%s", "range-state page restore failed; destination sequence was cleared\n");
+            return;
+        }
+        if (restored == 0) {
+            return;
+        }
+
+        slot.prompt.tokens = task.tokens.clone();
+        // Text tasks intentionally tokenize into a non-MTMD container so they
+        // can use text/speculative helpers. Once adopted by a persistent slot,
+        // restore the slot capability or a later image continuation will abort
+        // when it appends the first media placeholder.
+        slot.prompt.tokens.has_mtmd = mctx != nullptr;
+        slot.prompt.tokens.keep_first(restored);
+        slot.prompt.checkpoints.clear();
+        SLT_TRC(slot, "restored %zu prompt tokens from range-state pages\n", restored);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!task.params.response_scope.empty() && (!prompt_page_cache ||
+                !prompt_page_cache->lease_prepared(task.params.response_scope, task.params.response_revision,
+                    task.params.response_generation))) {
+            response_registry.finish(task.id); // no slot/GPU work was admitted
+            send_error(task, "primary context lease was released or expired", ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        // Adoption and later capture must share one native request identity.
+        task.params.cache_control.request_id = task.id;
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1992,6 +3893,44 @@ private:
             return false;
         }
 
+        // MTP cannot mirror image-embedding batches into its draft context. A
+        // media task therefore leaves the draft at the text prefix before the
+        // first image. When this slot returns to text-only work, replay from
+        // position zero so both draft KV and MTP's pending hidden-state carry
+        // are reconstructed; a target/draft page restore alone does not restore
+        // that carry.
+        const bool replay_mtp_after_media = spec && slot.spec == nullptr && !task.tokens.has_media();
+        slot.prompt_page_boundaries = prompt_page_cache_eligible(slot, task)
+            ? task.tokens.page_boundaries(prompt_page_cache->page_size_tokens())
+            : std::vector<server_tokens::page_boundary>{};
+        if (prompt_page_cache_eligible(slot, task)) {
+            // The final prompt token is replayed to produce logits on a
+            // same-prompt cache hit. Split the decode at n-1 so the exact
+            // predecessor state is also captured, even if no coarse page
+            // boundary falls near the endpoint.
+            const size_t penultimate = task.tokens.size() > 1 ? task.tokens.size() - 1 : 0;
+            if (penultimate > 0 && task.tokens.complete_boundary(penultimate)) {
+                const server_tokens::page_boundary boundary{
+                    penultimate, task.tokens.pos_next(penultimate),
+                };
+                const auto at = std::lower_bound(
+                    slot.prompt_page_boundaries.begin(), slot.prompt_page_boundaries.end(), penultimate,
+                    [](const auto & item, size_t count) { return item.token_count < count; });
+                if (at == slot.prompt_page_boundaries.end() || at->token_count != penultimate) {
+                    slot.prompt_page_boundaries.insert(at, boundary);
+                }
+            }
+        }
+
+        if (replay_mtp_after_media) {
+            slot.prompt_clear();
+        }
+        slot.spec = task.tokens.has_media() ? nullptr : spec.get();
+
+        if (!replay_mtp_after_media) {
+            restore_prompt_pages(slot, task);
+        }
+
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         if (task.type == SERVER_TASK_TYPE_TTS) {
@@ -2020,7 +3959,7 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
+            bool use_backend_sampling = task.params.sampling.backend_sampling && !task.params.prefill_only;
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
@@ -2133,6 +4072,12 @@ private:
 
         if (incomplete) {
             slot.has_next_token = true;
+            if (slot.task->params.stream && slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                // Token provenance must not wait for a complete UTF-8 character.
+                auto token_only = result;
+                token_only.text_to_send.clear();
+                send_partial_response(slot, token_only, false);
+            }
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
@@ -2352,6 +4297,7 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        if (moe_trace) { moe_trace->finish("request_complete"); }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2456,6 +4402,166 @@ private:
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
 
+        queue_results.send(std::move(res));
+    }
+
+    void send_hidden_states(const server_slot & slot) {
+        ctx_tgt->synchronize();
+
+        auto res = std::make_unique<server_task_result_hidden_state>();
+        res->id              = slot.task->id;
+        res->index           = slot.task->index;
+        res->n_tokens        = slot.task->n_tokens();
+        res->n_embd          = llama_model_n_embd(model_tgt);
+        res->pooling         = slot.task->hidden_state_pooling;
+        res->encoding_format = slot.task->hidden_state_encoding_format;
+        res->include_tokens  = slot.task->hidden_state_include_tokens;
+        res->tokens          = slot.task->tokens.get_text_tokens();
+
+        const auto & hidden_by_layer = ctx_tgt->get_hidden_states();
+        const int32_t n_embd = res->n_embd;
+        const auto & selected_indices = slot.task->hidden_state_token_indices;
+
+        if (slot.task->hidden_state_ltx25) {
+            constexpr int32_t sequence_length = 1024;
+            constexpr int32_t state_count = 49;
+            const int32_t token_count = slot.task->n_tokens();
+            const size_t state_values = (size_t) token_count*n_embd;
+            const size_t payload_size = (size_t) state_count*state_values*sizeof(uint16_t);
+            const llama_token pad_token = llama_vocab_pad(vocab);
+            if (pad_token == LLAMA_TOKEN_NULL) {
+                send_error(slot, "LTX-2.5 tokenizer has no padding token", ERROR_TYPE_SERVER);
+                return;
+            }
+
+            json header {
+                {"schema", "serverless-host.ltx25.hidden-states-wire.v1"},
+                {"byte_order", "little"},
+                {"dtype", "BF16"},
+                {"sequence_length", sequence_length},
+                {"token_count", token_count},
+                {"position_offset", slot.task->hidden_state_position_offset},
+                {"hidden_size", n_embd},
+                {"state_count", state_count},
+                {"payload_bytes", payload_size},
+                {"pad_token_id", pad_token},
+                {"input_ids", res->tokens},
+            };
+            const std::string header_data = safe_json_to_str(header);
+            const uint64_t header_size = header_data.size();
+
+            res->binary_data.resize(sizeof(header_size) + header_size + payload_size);
+            for (size_t i = 0; i < sizeof(header_size); ++i) {
+                res->binary_data[i] = (char) ((header_size >> (8*i)) & 0xff);
+            }
+            std::memcpy(res->binary_data.data() + sizeof(header_size), header_data.data(), header_size);
+
+            char * dst = res->binary_data.data() + sizeof(header_size) + header_size;
+            for (int32_t state = 0; state < state_count; ++state) {
+                const int32_t key = state == 0
+                    ? LLAMA_HIDDEN_STATE_KEY_SCALED_INPUT
+                    : state == state_count - 1
+                        ? LLAMA_HIDDEN_STATE_KEY_FINAL_NORM
+                        : state - 1;
+                auto it = hidden_by_layer.find(key);
+                if (it == hidden_by_layer.end() || it->second.size() != state_values) {
+                    SLT_ERR(slot, "missing or malformed LTX-2.5 hidden state %d (capture key %d)\n", state, key);
+                    send_error(slot, "missing or malformed LTX-2.5 hidden state", ERROR_TYPE_SERVER);
+                    return;
+                }
+                for (float value : it->second) {
+                    const uint16_t bits = ggml_fp32_to_bf16(value).bits;
+                    *dst++ = (char) (bits & 0xff);
+                    *dst++ = (char) (bits >> 8);
+                }
+            }
+
+            SLT_DBG(slot, "%s", "sending LTX-2.5 hidden states\n");
+            queue_results.send(std::move(res));
+            return;
+        }
+
+        auto vector_to_json = [](const float * data, int32_t n) {
+            json values = json::array();
+            for (int32_t i = 0; i < n; ++i) {
+                values.push_back(data[i]);
+            }
+            return values;
+        };
+
+        auto vector_to_base64 = [](const float * data, int32_t n) {
+            return base64::encode(reinterpret_cast<const char *>(data), (size_t) n*sizeof(float));
+        };
+
+        json hidden_states = json::array();
+        for (int32_t il : slot.task->hidden_state_layers) {
+            res->layers.push_back(il);
+            auto it = hidden_by_layer.find(il);
+            if (it == hidden_by_layer.end()) {
+                SLT_ERR(slot, "missing captured hidden state for layer %d\n", il);
+                continue;
+            }
+
+            const auto & values = it->second;
+            json layer_obj {
+                {"layer", il},
+                {"dtype", "float32"},
+            };
+
+            if (slot.task->hidden_state_pooling == "none") {
+                json rows = json::array();
+                std::vector<float> packed;
+                if (slot.task->hidden_state_encoding_format == "base64") {
+                    packed.reserve((size_t) selected_indices.size()*n_embd);
+                }
+                for (int32_t idx : selected_indices) {
+                    const float * row = values.data() + (size_t) idx*n_embd;
+                    if (slot.task->hidden_state_encoding_format == "base64") {
+                        packed.insert(packed.end(), row, row + n_embd);
+                    } else {
+                        rows.push_back(vector_to_json(row, n_embd));
+                    }
+                }
+                layer_obj["shape"] = json::array({ (int32_t) selected_indices.size(), n_embd });
+                if (slot.task->hidden_state_encoding_format == "base64") {
+                    layer_obj["data"] = vector_to_base64(packed.data(), (int32_t) packed.size());
+                } else {
+                    layer_obj["data"] = rows;
+                }
+            } else {
+                std::vector<float> pooled(n_embd, 0.0f);
+                if (slot.task->hidden_state_pooling == "mean") {
+                    for (int32_t idx : selected_indices) {
+                        const float * row = values.data() + (size_t) idx*n_embd;
+                        for (int32_t j = 0; j < n_embd; ++j) {
+                            pooled[j] += row[j];
+                        }
+                    }
+                    const float denom = (float) selected_indices.size();
+                    for (float & value : pooled) {
+                        value /= denom;
+                    }
+                } else {
+                    const int32_t idx = slot.task->hidden_state_pooling == "cls"
+                        ? selected_indices.front()
+                        : selected_indices.back();
+                    const float * row = values.data() + (size_t) idx*n_embd;
+                    std::copy(row, row + n_embd, pooled.begin());
+                }
+
+                layer_obj["shape"] = { n_embd };
+                if (slot.task->hidden_state_encoding_format == "base64") {
+                    layer_obj["data"] = vector_to_base64(pooled.data(), n_embd);
+                } else {
+                    layer_obj["data"] = vector_to_json(pooled.data(), n_embd);
+                }
+            }
+
+            hidden_states.push_back(layer_obj);
+        }
+
+        res->hidden_states = hidden_states;
+        SLT_DBG(slot, "%s", "sending hidden states\n");
         queue_results.send(std::move(res));
     }
 
@@ -2944,7 +5050,8 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+                task.type != SERVER_TASK_TYPE_RESPONSES_CONTEXT) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -2954,6 +5061,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_TRANSCRIBE_RT:
             case SERVER_TASK_TYPE_EMBEDDING:
+            case SERVER_TASK_TYPE_HIDDEN_STATE:
             case SERVER_TASK_TYPE_RERANK:
             case SERVER_TASK_TYPE_TTS:
             case SERVER_TASK_TYPE_DECISION:
@@ -3026,6 +5134,11 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    // Responses cancellation is acknowledged only after model
+                    // work is synchronized and the exact queued/active task ends.
+                    const bool tracked = response_registry.owns(task.id_target);
+                    if (tracked && ctx_tgt) llama_synchronize(ctx_tgt);
+                    if (tracked && ctx_dft) llama_synchronize(ctx_dft);
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
@@ -3033,6 +5146,41 @@ private:
                             break;
                         }
                     }
+                    response_registry.finish(task.id_target); // also covers removed queued/deferred tasks
+                } break;
+            case SERVER_TASK_TYPE_RESPONSES_CONTEXT:
+                {
+                    auto result = std::make_unique<server_task_result_responses_context>();
+                    result->id = task.id;
+                    result->proof = prompt_page_cache ? prompt_page_cache->context_control(task.response_context)
+                        : json{{"success", false}, {"reason", "page cache unavailable"}};
+                    queue_results.send(std::move(result));
+                } break;
+            case SERVER_TASK_TYPE_RESPONSES_SUSPEND:
+                {
+                    auto reply = std::make_unique<server_task_result_control>();
+                    reply->id = task.id;
+                    reply->success = false;
+                    reply->message = "no safe prefill request";
+                    for (auto & slot : slots) {
+                        if (!slot.task || slot.task->id != task.id_target) continue;
+                        if (slot.stats.n_gen != 0 || slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                            reply->message = "decode suspend is not enabled yet";
+                            break;
+                        }
+                        if (ctx_tgt) llama_synchronize(ctx_tgt);
+                        if (!slot.prompt.tokens.empty()) capture_prompt_page(slot, true);
+                        auto marker = std::make_unique<server_task_result_responses_suspended>();
+                        marker->id = slot.task->id;
+                        marker->index = slot.task->index;
+                        marker->request_id = slot.task->params.serverless_request_id;
+                        queue_results.send(std::move(marker));
+                        slot.release();
+                        reply->success = true;
+                        reply->message = "prefill suspended";
+                        break;
+                    }
+                    queue_results.send(std::move(reply));
                 } break;
             case SERVER_TASK_TYPE_CONTROL:
                 {
@@ -3081,6 +5229,16 @@ private:
                         res->message = "unknown control action";
                     }
 
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CACHE_RELEASE:
+                {
+                    auto res = std::make_unique<server_task_result_cache_release>();
+                    res->id = task.id;
+                    res->success = prompt_page_cache != nullptr;
+                    if (prompt_page_cache) {
+                        res->released_nodes = prompt_page_cache->release_branch(task.cache_branch);
+                    }
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
@@ -3442,6 +5600,12 @@ private:
         }
 #endif
 
+        if (prompt_page_cache) {
+            std::unordered_set<int> active_tasks;
+            for (const auto & slot : slots) if (slot.task && slot.is_processing()) active_tasks.insert(slot.task->id);
+            prompt_page_cache->maintenance(active_tasks);
+        }
+
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
         {
@@ -3508,6 +5672,7 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            ctx_tgt->set_hidden_state_layers(slot_batched->task->hidden_state_layers);
         }
 
         int32_t off_next = 0;
@@ -3779,7 +5944,10 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                server_roctx_scope range("glm53.mtp.draft");
+                common_moe_trace_scope capture(moe_trace.get(), common_moe_trace_phase::draft);
                 common_speculative_draft(spec.get());
+                capture.end(0);
             });
         }
 
@@ -3789,6 +5957,7 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            if (moe_trace) { moe_trace->proposed(draft.size()); }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3884,6 +6053,16 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        // A text-only task (including a restored prompt page) can replace the
+                        // slot's token container with one that has_mtmd=false. Re-enable the
+                        // media-aware cache path before comparing prefixes or appending image
+                        // placeholders for a later multimodal task on the same slot.
+                        if (input_tokens.has_media()) {
+                            GGML_ASSERT(mctx != nullptr);
+                            GGML_ASSERT(slot.prompt.tokens.has_mtmd || !slot.prompt.tokens.has_media());
+                            slot.prompt.tokens.has_mtmd = true;
+                        }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4136,24 +6315,25 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
-                                            !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-                                            if (it->id_task != -1) {
-                                                GGML_ABORT("failed to restore context checkpoint\n");
-                                            }
-                                            // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
-                                            SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
+                                        auto restore = [&](bool draft) {
+                                            auto load = [&] { return draft ? it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); };
+                                            bool ok = load();
+                                            while (!ok && try_clear_idle_slots()) ok = load();
+                                            return ok;
+                                        };
+
+                                        const bool restored = restore(false) && restore(true);
+                                        if (!restored) {
+                                            SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                                    it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
                                             do_reset = true;
+                                        } else {
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n",
+                                                    it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                         }
-                                    }
-
-                                    if (!do_reset) {
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
@@ -4319,11 +6499,16 @@ private:
                             slot.prompt.tokens.push_back_placeholder(chunk.get());
                         }
 
+                        // Media chunks are atomic and may cross the nominal page span.
+                        // Capture immediately while this is still the hybrid-memory tail.
+                        capture_prompt_page(slot);
+
                         has_mtmd = true;
                     }
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    const auto * next_page_boundary = next_prompt_page_boundary(slot);
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
@@ -4358,13 +6543,19 @@ private:
                         // streaming hook can mirror t_h_nextn into ctx_dft.
                         add_ok &= batch.add(slot.id,
                             cur_tok,
-                            /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
+                            /* pos       = */ slot.prompt.tokens.pos_next() + slot.task->hidden_state_position_offset,
+                            /* output    = */ slot.task->need_embd(),
                             /* is_prompt = */ true);
                         if (!slot.task->decision.order.empty()) {
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        // A hybrid range-state page must be captured at its exact recurrent tail.
+                        // Stop the prompt batch here so post_decode() can serialize that boundary.
+                        if (next_page_boundary && (size_t) slot.prompt.n_tokens() == next_page_boundary->token_count) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -4556,11 +6747,22 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        bool capture_prompt = false, capture_replay = false;
+        if (moe_trace) {
+            for (int i = off; i < off + batch.view.size(); ++i) {
+                capture_prompt |= batch.tokens[i].is_prompt;
+                capture_replay |= slots[batch.tokens[i].id_slot].spec_is_replay;
+            }
+        }
         queue_tasks.yield_to_queue([&]() {
+            server_roctx_scope range("glm53.target");
+            common_moe_trace_scope capture(moe_trace.get(), common_moe_trace_phase::target,
+                                           batch.view.size(), capture_prompt, capture_replay);
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            capture.end(ret, ret == 0 && has_output);
         });
 
         if (ret != 0) {
@@ -4619,10 +6821,14 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        if (spec && batch.slot_batched && batch.slot_batched->can_speculate()) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                server_roctx_scope range("glm53.mtp.process");
+                common_moe_trace_scope capture(moe_trace.get(), common_moe_trace_phase::process,
+                                               batch.view.size(), capture_prompt, capture_replay);
                 ok = common_speculative_process(spec.get(), batch.view);
+                capture.end(ok ? 0 : -1);
             });
 
             if (!ok) {
@@ -4677,6 +6883,33 @@ private:
             }
         });
 
+        iterate(slots, [&](server_slot & slot) {
+            if (!slot.task || !prompt_page_cache_eligible(slot, *slot.task) ||
+                    slot.prompt.tokens.empty() || slot.prompt.tokens.pos_next() <= 0) {
+                return;
+            }
+
+            bool decoded_prompt_tail = false;
+            for (int32_t i = off; i < off + n_batch_tokens; ++i) {
+                const auto & token = batch.tokens[i];
+                if (token.id_slot == slot.id && token.is_prompt &&
+                        token.pos[0] + 1 == slot.prompt.tokens.pos_next()) {
+                    decoded_prompt_tail = true;
+                    break;
+                }
+            }
+            if (!decoded_prompt_tail) {
+                return;
+            }
+
+            const bool penultimate = slot.prompt.tokens.size() + 1 == slot.task->tokens.size();
+            if (prompt_page_cache_boundary(slot)) {
+                capture_prompt_page(slot, penultimate);
+            } else if (penultimate || slot.state == SLOT_STATE_DONE_PROMPT) {
+                capture_prompt_page(slot, true);
+            }
+        });
+
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
@@ -4696,6 +6929,13 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (slot.task->type == SERVER_TASK_TYPE_HIDDEN_STATE) {
+                    send_hidden_states(slot);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch.view);
@@ -4713,6 +6953,18 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
                     send_decision(slot, batch.view, slot.i_batch - off);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->params.prefill_only) {
+                    llama_synchronize(slot.ctx_tgt);
+                    slot.stats.update_prompt_last();
+                    slot.stop = STOP_TYPE_EOS;
+                    slot.has_next_token = false;
+                    slot.print_timings();
+                    send_final_response(slot);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -4828,6 +7080,10 @@ private:
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                if (moe_trace) {
+                    moe_trace->accepted(n_draft, accepted.size() - 1, slot.spec_is_replay,
+                                        n_rollback > 0 && use_ckpt_tgt);
+                }
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -5185,6 +7441,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     }
 
     int32_t sse_ping_interval = params.sse_ping_interval;
+    const uint64_t sensitive_trace_id = sensitive_trace_path() == nullptr ? 0 : g_sensitive_trace_next_id.fetch_add(1);
+    if (sensitive_trace_id != 0) {
+        sensitive_trace_append(
+            "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " begin =====\n" +
+            req.body +
+            "\n----- raw output chunks -----\n");
+    }
 
     try {
         std::vector<server_task> tasks;
@@ -5229,6 +7492,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.apply_chat_session(chat_session);
+            task.params.serverless_request_id = json_value(data, "serverless_request_id", std::string{});
+            if (data.contains("serverless_context")) {
+                const auto & context = data.at("serverless_context");
+                task.params.response_scope = context.at("scope").get<std::string>();
+                task.params.response_revision = context.at("revision").get<std::string>();
+                task.params.response_generation = context.at("generation").get<uint64_t>();
+                if (task.params.serverless_request_id.empty() ||
+                        task.params.response_revision != "resp_" + task.params.serverless_request_id.substr(4, 32))
+                    throw std::invalid_argument("context revision does not match response request identity");
+            }
+
+            if (!task.params.serverless_request_id.empty() && (inputs.size() != 1 || task.params.n_cmpl != 1)) {
+                throw std::invalid_argument("serverless Responses require one native completion");
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5249,8 +7526,21 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
-        rd.post_tasks(std::move(tasks), chat_session);
+        const std::string request_id = json_value(data, "serverless_request_id", std::string{});
+        if (!request_id.empty()) {
+            std::vector<int> ids;
+            for (const auto & task : tasks) ids.push_back(task.id);
+            if (!ctx_server.request_registry().post(request_id, ids, [&] { rd.post_tasks(std::move(tasks), chat_session); })) {
+                throw std::invalid_argument("serverless response was cancelled during preparation");
+            }
+        } else {
+            rd.post_tasks(std::move(tasks), chat_session);
+        }
     } catch (const std::exception & e) {
+        if (sensitive_trace_id != 0) {
+            sensitive_trace_append(
+                "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end: invalid request =====\n");
+        }
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -5274,6 +7564,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
                 // if single request, return single object instead of array
+                if (sensitive_trace_id != 0) {
+                    sensitive_trace_append(
+                        sensitive_trace_output_text(arr[0]) +
+                        "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end =====\n");
+                }
                 res->ok(arr[0]);
             } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
                 // if multiple results in OAI format, we need to re-format them
@@ -5281,6 +7576,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 json & choices = arr[0]["choices"];
                 for (size_t i = 1; i < arr.size(); i++) {
                     choices.push_back(std::move(arr[i]["choices"][0]));
+                }
+                if (sensitive_trace_id != 0) {
+                    sensitive_trace_append(
+                        sensitive_trace_output_text(arr[0]) +
+                        "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end =====\n");
                 }
 
                 // OAI counts generated tokens across all choices
@@ -5294,6 +7594,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 res->ok(arr[0]);
             } else {
                 // multi-results, non-OAI compat
+                if (sensitive_trace_id != 0) {
+                    std::string trace_text;
+                    for (const auto & item : arr) {
+                        trace_text += sensitive_trace_output_text(item);
+                    }
+                    sensitive_trace_append(
+                        trace_text +
+                        "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end =====\n");
+                }
                 res->ok(arr);
             }
         }
@@ -5304,22 +7613,30 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto first_result = rd.next(req.should_stop);
         if (first_result == nullptr) {
             GGML_ASSERT(req.should_stop());
+            if (sensitive_trace_id != 0) {
+                sensitive_trace_append(
+                    "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end: client stopped =====\n");
+            }
             return res; // connection is closed
         }
 
         if (first_result->is_error()) {
+            if (sensitive_trace_id != 0) {
+                sensitive_trace_append(
+                    "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end: error =====\n");
+            }
             res->error(first_result->to_json());
             return res;
         }
 
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
+        GGML_ASSERT(server_task_result_is_completion_stream(first_result.get()));
 
         // next responses are streamed
         // to be sent immediately
         json first_result_json = first_result->to_json();
+        if (sensitive_trace_id != 0) {
+            sensitive_trace_append(sensitive_trace_output_text(first_result_json));
+        }
         if (first_result_json == nullptr) {
             res->data = ""; // simply send HTTP headers and status code
         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
@@ -5331,7 +7648,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->set_next([res_this = res.get(), res_type, sse_ping_interval](std::string & output) -> bool {
+        res->set_next([res_this = res.get(), res_type, sse_ping_interval, sensitive_trace_id](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -5350,6 +7667,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             try {
                 if (effective_should_stop()) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                    if (sensitive_trace_id != 0) {
+                        sensitive_trace_append(
+                            "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end: client stopped =====\n");
+                    }
                     return false; // should_stop condition met
                 }
 
@@ -5376,6 +7697,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             break;
                     }
                     SRV_DBG("%s", "all results received, terminating stream\n");
+                    if (sensitive_trace_id != 0) {
+                        sensitive_trace_append(
+                            "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end =====\n");
+                    }
                     return false; // no more data, terminate
                 }
 
@@ -5402,6 +7727,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (result == nullptr) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(effective_should_stop());
+                    if (sensitive_trace_id != 0) {
+                        sensitive_trace_append(
+                            "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end: client stopped =====\n");
+                    }
                     return false; // should_stop condition met
                 }
 
@@ -5410,13 +7739,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     json res_json = result->to_json();
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
+                    if (sensitive_trace_id != 0) {
+                        sensitive_trace_append(
+                            "\n===== llama.cpp request " + std::to_string(sensitive_trace_id) + " end: error =====\n");
+                    }
                     return false; // terminate on error
                 } else {
-                    GGML_ASSERT(
-                        dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
-                        || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
-                    );
+                    GGML_ASSERT(server_task_result_is_completion_stream(result.get()));
                     json res_json = result->to_json();
+                    if (sensitive_trace_id != 0) {
+                        sensitive_trace_append(sensitive_trace_output_text(res_json));
+                    }
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
@@ -5835,7 +8168,7 @@ void server_routes::init_routes() {
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
-        const json body = json::parse(req.body);
+        json body = json::parse(req.body);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5847,7 +8180,7 @@ void server_routes::init_routes() {
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
-        const json body = json::parse(req.body);
+        json body = json::parse(req.body);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5917,10 +8250,112 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_responses_capabilities = [this](const server_http_req &) {
+        auto res = create_response(true); // pure control metadata; never wakes a model
+        res->ok({{"interface_version", 1}, {"response_format", true}, {"request_registry", true},
+                 {"partial_prefill", true}, {"prefill_suspend", true}, {"decode_suspend", false}, {"cache_ownership", true}, {"renderer_profile", "glm53-native-responses-v1"}});
+        return res;
+    };
+
+    this->post_responses_context = [this](const server_http_req & req) {
+        auto res = create_response(true); // control never wakes/loads the model
+        const json body = json::parse(req.body);
+        const auto scope = json_value(body, "scope", std::string{});
+        const auto action = json_value(body, "action", std::string{});
+        if (scope.size() != 64 || scope.find_first_not_of("0123456789abcdef") != std::string::npos)
+            throw std::invalid_argument("invalid context scope identity");
+        if (body.contains("expected_namespace")) {
+            const auto expected_namespace = body.at("expected_namespace").get<std::string>();
+            const std::string current_namespace = std::getenv("LLAMA_SERVER_PAGE_CACHE_NAMESPACE")
+                ? std::getenv("LLAMA_SERVER_PAGE_CACHE_NAMESPACE") : "";
+            if (expected_namespace != current_namespace) throw std::invalid_argument("context namespace changed");
+        }
+        const std::set<std::string> actions{"state", "prepare", "observe", "commit", "release", "abandon"};
+        if (!actions.count(action)) throw std::invalid_argument("invalid context action");
+        for (const auto & item : body.items()) {
+            const std::set<std::string> allowed{"scope", "action", "revision", "expected", "generation", "branch", "old_branch", "minimum_tokens", "lease_ms", "expected_namespace"};
+            if (!allowed.count(item.key())) throw std::invalid_argument("unknown context field");
+        }
+        for (const auto field : {"revision", "expected"}) if (body.contains(field)) {
+            const auto value = body.at(field).get<std::string>();
+            if (!value.empty() && (value.size() != 37 || value.substr(0,5) != "resp_" ||
+                    value.substr(5).find_first_not_of("0123456789abcdef") != std::string::npos))
+                throw std::invalid_argument("invalid context revision");
+        }
+        for (const auto field : {"generation", "minimum_tokens", "lease_ms"}) if (body.contains(field)) {
+            const auto & value = body.at(field);
+            if (!value.is_number_integer() || value.is_boolean() || value.get<int64_t>() < 0)
+                throw std::invalid_argument("invalid context numeric field");
+        }
+        if (body.contains("lease_ms") && (body.at("lease_ms").get<uint64_t>() == 0 || body.at("lease_ms").get<uint64_t>() > 7200000))
+            throw std::invalid_argument("invalid context lease duration");
+        if (action == "prepare" && (!body.contains("revision") || !body.contains("generation")))
+            throw std::invalid_argument("context prepare needs revision and generation");
+        if (action == "observe" && (!body.contains("revision") || !body.contains("branch") || !body.contains("minimum_tokens")))
+            throw std::invalid_argument("context observe needs revision, branch and endpoint");
+        for (const auto field : {"branch", "old_branch"}) if (body.contains(field))
+            server_schema::parse_cache_control(json{{"branch", body.at(field)}});
+        server_task task(SERVER_TASK_TYPE_RESPONSES_CONTEXT);
+        task.id = res->rd.get_new_id(); task.response_context = body;
+        if (!res->rd.post_task_if_awake(std::move(task), true)) {
+            res->ok({{"success", false}, {"reason", "worker sleeping or stopped"}});
+            return res;
+        }
+        const auto result = res->rd.next(req.should_stop);
+        if (!result || result->is_error()) throw std::runtime_error("native context control did not acknowledge");
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_responses_suspend = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const json body = json::parse(req.body);
+        const std::string id = json_value(body, "request_id", std::string{});
+        if (!server_responses_registry::valid_id(id)) throw std::invalid_argument("invalid suspend identity");
+        const auto targets = ctx_server.request_registry().targets(id);
+        if (targets.size() != 1) {
+            res->ok({{"request_id", id}, {"suspended", false}, {"released", false}});
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_RESPONSES_SUSPEND);
+        task.id = res->rd.get_new_id();
+        task.id_target = targets.front();
+        res->rd.post_task(std::move(task), true);
+        const auto result = res->rd.next(req.should_stop);
+        if (!result || result->is_error()) throw std::runtime_error("native suspend did not acknowledge");
+        const auto * reply = dynamic_cast<server_task_result_control *>(result.get());
+        res->ok({{"request_id", id}, {"suspended", reply && reply->success},
+                 {"released", ctx_server.request_registry().released(id)}});
+        return res;
+    };
+
+    this->post_responses_cancel = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const json body = json::parse(req.body);
+        if (!body.is_object() || body.size() != 1 || !body.contains("request_id") || !body.at("request_id").is_string()) {
+            throw std::invalid_argument("cancel requires only a request_id string");
+        }
+        const std::string id = body.at("request_id");
+        const auto targets = ctx_server.request_registry().cancel(id);
+        std::vector<server_task> tasks;
+        for (int target : targets) {
+            server_task task(SERVER_TASK_TYPE_CANCEL);
+            task.id_target = target;
+            tasks.push_back(std::move(task));
+        }
+        if (!tasks.empty()) queue_tasks.post(std::move(tasks), true);
+        res->ok({{"request_id", id}, {"released", ctx_server.request_registry().released(id)}});
+        return res;
+    };
+
     this->post_responses_oai = [this](const server_http_req & req) {
+        json incoming = json::parse(req.body);
+        const std::string id = json_value(incoming, "serverless_request_id", std::string{});
+        std::unique_ptr<server_responses_preparing_guard> preparing;
+        if (!id.empty()) preparing = std::make_unique<server_responses_preparing_guard>(ctx_server.request_registry(), id);
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
+        json body = server_chat_convert_responses_to_chatcmpl(incoming);
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         common_chat_session session;
@@ -5930,6 +8365,8 @@ void server_routes::init_routes() {
             meta->chat_params,
             files,
             session);
+        if (!id.empty()) body_parsed["serverless_request_id"] = id;
+        if (incoming.contains("serverless_context")) body_parsed["serverless_context"] = incoming.at("serverless_context");
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -6208,6 +8645,66 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->post_cache_release = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::string branch;
+        try {
+            const json body = json::parse(req.body);
+            if (!body.is_object() || body.size() != 1 || !body.contains("branch")) {
+                throw std::invalid_argument("cache release requires only a branch string");
+            }
+            branch = server_schema::parse_cache_control(body).branch;
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        server_task task(SERVER_TASK_TYPE_CACHE_RELEASE);
+        task.id = rd.get_new_id();
+        task.cache_branch = std::move(branch);
+        rd.post_task(std::move(task));
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_cache_probe = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::vector<raw_buffer> files;
+        json body = json::parse(req.body);
+
+        json prompt;
+        if (body.contains("messages")) {
+            common_chat_session session;
+            json data = oaicompat_chat_params_parse(
+                ctx_server.vocab, body, meta->chat_params, files, session);
+            prompt = std::move(data.at("prompt"));
+        } else if (body.contains("prompt")) {
+            prompt = body.at("prompt");
+        } else if (body.contains("content")) {
+            prompt = body.at("content");
+        } else {
+            throw std::runtime_error("cache probe requires messages, prompt, or content");
+        }
+
+        auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+        if (tokenized_prompts.size() != 1) {
+            throw std::runtime_error("cache probe expects exactly one prompt");
+        }
+
+        res->ok(ctx_server.probe_prompt_cache(tokenized_prompts[0]));
+        return res;
+    };
+
     this->get_models = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
@@ -6281,6 +8778,10 @@ void server_routes::init_routes() {
 
     this->post_embeddings_oai = [this](const server_http_req & req) {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+    };
+
+    this->post_hidden_states = [this](const server_http_req & req) {
+        return handle_hidden_states_impl(req);
     };
 
     this->post_rerank = [this](const server_http_req & req) {
@@ -6968,4 +9469,130 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
         should_reset_buckets = false;
     }
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_hidden_states_impl(const server_http_req & req) {
+    auto res = create_response();
+    const json body = json::parse(req.body);
+
+    if (!body.contains("prompt")) {
+        res->error(format_error_response("\"prompt\" is required", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const bool ltx25_layout = json_value(body, "layout", std::string()) == "ltx25";
+    if (!ltx25_layout && !body.at("prompt").is_string()) {
+        res->error(format_error_response("\"prompt\" must be provided as a string", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (ltx25_layout && !json_is_array_of_numbers(body.at("prompt"))) {
+        res->error(format_error_response("LTX-2.5 layout requires prompt as an explicit token ID array", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (ltx25_layout && (ctx_server.model_tgt->arch != LLM_ARCH_GEMMA4 ||
+            llama_model_n_layer(ctx_server.model_tgt) != 48 || llama_model_n_embd(ctx_server.model_tgt) != 3840)) {
+        res->error(format_error_response("LTX-2.5 layout requires the 48-layer, 3840-wide Gemma4 model", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (ltx25_layout && meta->slot_n_ctx < 1024) {
+        res->error(format_error_response("LTX-2.5 layout requires a context size of at least 1024", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    std::string pooling = json_value(body, "pooling", std::string("none"));
+    if (pooling != "none" && pooling != "mean" && pooling != "cls" && pooling != "last") {
+        res->error(format_error_response("pooling must be one of none, mean, cls, or last", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    std::string encoding_format = json_value(body, "encoding_format", std::string("json"));
+    if (encoding_format != "json" && encoding_format != "base64") {
+        res->error(format_error_response("encoding_format must be either json or base64", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    std::vector<int32_t> layers;
+    if (!ltx25_layout) {
+        try {
+            layers = parse_hidden_state_layers(body, llama_model_n_layer(ctx_server.model_tgt));
+        } catch (const std::exception & err) {
+            res->error(format_error_response(err.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    } else {
+        layers.push_back(LLAMA_HIDDEN_STATE_KEY_SCALED_INPUT);
+        for (int32_t il = 0; il < 47; ++il) {
+            layers.push_back(il);
+        }
+        layers.push_back(LLAMA_HIDDEN_STATE_KEY_FINAL_NORM);
+    }
+
+    json prompt = body.at("prompt");
+    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+    if (tokenized_prompts.size() != 1) {
+        res->error(format_error_response("hidden-state extraction supports exactly one prompt per request", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (tokenized_prompts[0].empty()) {
+        res->error(format_error_response("prompt cannot be empty", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (ltx25_layout && tokenized_prompts[0].size() > 1024) {
+        res->error(format_error_response("LTX-2.5 token input exceeds 1024 tokens", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    std::vector<int32_t> token_indices;
+    if (!ltx25_layout) {
+        try {
+            token_indices = parse_hidden_state_token_indices(body, (int32_t) tokenized_prompts[0].size());
+        } catch (const std::exception & err) {
+            res->error(format_error_response(err.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task = server_task(SERVER_TASK_TYPE_HIDDEN_STATE);
+        task.id     = rd.get_new_id();
+        task.tokens = std::move(tokenized_prompts[0]);
+        task.hidden_state_layers = std::set<int32_t>(layers.begin(), layers.end());
+        task.hidden_state_token_indices = std::move(token_indices);
+        task.hidden_state_pooling = pooling;
+        task.hidden_state_encoding_format = encoding_format;
+        task.hidden_state_include_tokens = json_value(body, "include_tokens", false);
+        task.hidden_state_ltx25 = ltx25_layout;
+        if (ltx25_layout) {
+            task.params.cache_prompt = false;
+            task.hidden_state_include_tokens = true;
+            task.hidden_state_position_offset = 1024 - task.n_tokens();
+        }
+
+        rd.post_task(std::move(task));
+    }
+
+    auto all_results = rd.wait_for_all(req.should_stop);
+
+    if (all_results.is_terminated) {
+        return res;
+    } else if (all_results.error) {
+        res->error(all_results.error->to_json());
+        return res;
+    } else {
+        GGML_ASSERT(all_results.results.size() == 1);
+        auto * hidden_res = dynamic_cast<server_task_result_hidden_state*>(all_results.results[0].get());
+        GGML_ASSERT(hidden_res != nullptr);
+        if (ltx25_layout) {
+            res->status = 200;
+            res->content_type = "application/vnd.serverless-host.ltx25-hidden-states";
+            res->data = std::move(hidden_res->binary_data);
+        } else {
+            json root = hidden_res->to_json();
+            root["model"] = meta->model_name;
+            res->ok(root);
+        }
+    }
+
+    return res;
 }

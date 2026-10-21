@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO3_0 = 43, // runtime-only Turbo3 PolarQuant KV cache
+        GGML_TYPE_COUNT   = 44,
     };
 
     // [TAG_GGML_PREC]
@@ -552,6 +553,8 @@ extern "C" {
         GGML_OP_CONV_2D,
         GGML_OP_CONV_3D,
         GGML_OP_CONV_2D_DW,
+        GGML_OP_CONV_1D_GROUPED,
+        GGML_OP_ZAYA_QK_NORM,
         GGML_OP_CONV_TRANSPOSE_2D,
         GGML_OP_POOL_1D,
         GGML_OP_POOL_2D,
@@ -569,6 +572,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_TURBO3_INDEXED,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -600,6 +604,9 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        // Runtime-only signed Walsh-Hadamard transform for Turbo3 KV state.
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_COUNT,
     };
@@ -1733,6 +1740,20 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // Native F16 gather which preserves selected rows as F16 instead of
+    // promoting the ordinary GET_ROWS result to F32.
+    GGML_API struct ggml_tensor * ggml_get_rows_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // F16 data
+            struct ggml_tensor  * b); // row indices
+
+    // Narrow Turbo3 cache gather which materializes selected rows directly as
+    // F16 instead of the ordinary GET_ROWS F32 result.
+    GGML_API struct ggml_tensor * ggml_get_rows_turbo3_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // Turbo3 data
+            struct ggml_tensor  * b); // row indices
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
@@ -2135,6 +2156,22 @@ extern "C" {
             int                   s0,  // stride
             int                   d0); // dilation
 
+    GGML_API struct ggml_tensor * ggml_conv_1d_grouped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,      // convolution kernel
+            struct ggml_tensor  * b,      // data
+            int                   s0,     // stride
+            int                   p0,     // padding
+            int                   d0,     // dilation
+            int                   groups); // number of groups
+
+    GGML_API struct ggml_tensor * ggml_zaya_qk_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * qk,
+            struct ggml_tensor  * q_raw,
+            struct ggml_tensor  * k_raw,
+            struct ggml_tensor  * k_scale);
+
     GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // convolution kernel
@@ -2499,6 +2536,16 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Narrow GLM5Next sparse-attention seam. Q and the Turbo3 cache are in the
+    // signed-WHT domain; rows select one P-row cache window per query.
+    GGML_API struct ggml_tensor * ggml_flash_attn_turbo3_indexed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * mask,
+            float                 scale);
+
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec),
@@ -2665,6 +2712,13 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction,
+            int                   group_size,
+            struct ggml_tensor  * scale);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2709,6 +2763,12 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
+    // Expert outputs [n_embd, n_expert_used, n_tokens], weights [n_expert_used, n_tokens]
+    // -> [n_embd, n_tokens], preserving separately rounded F32 multiplies and ordered adds.
+    GGML_API struct ggml_tensor * ggml_moe_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights);
     // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
     //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
     //

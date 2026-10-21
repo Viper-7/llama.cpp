@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -174,6 +175,17 @@ struct mtmd_bitmap {
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
     bool mergeable = false; // [QWEN_VIDEO] set only on frames of the same video
+
+    // Media already encoded by an external projector service.
+    bool is_external = false;
+    bool is_video = false;
+    uint32_t ext_n_tokens = 0;
+    llama_pos ext_n_pos = 0;
+    int32_t ext_n_pos_per_embd = 0;
+    size_t ext_n_embd = 0;
+    bool ext_use_non_causal = false;
+    std::shared_ptr<std::vector<float>> ext_embd;
+    std::shared_ptr<std::vector<llama_pos>> ext_pos;
 
     // lazy-loaded bitmap
     mtmd_bitmap_lazy_callback lazy_callback = nullptr;
@@ -368,6 +380,31 @@ struct mtmd_input_chunk {
     mtmd_image_tokens_ptr tokens_image;
     mtmd_audio_tokens_ptr tokens_audio;
 
+    // Optional externally produced embedding payload. Serialization preserves
+    // its metadata and ID but intentionally creates a placeholder without the
+    // potentially large embedding/position buffers.
+    bool external = false;
+    bool external_is_video = false;
+    uint32_t ext_n_tokens = 0;
+    llama_pos ext_n_pos = 0;
+    int32_t ext_n_pos_per_embd = 0;
+    size_t ext_n_embd = 0;
+    bool ext_use_non_causal = false;
+    std::string ext_id;
+    std::shared_ptr<std::vector<float>> ext_embd;
+    std::shared_ptr<std::vector<llama_pos>> ext_pos;
+
+    mtmd_input_chunk() = default;
+    mtmd_input_chunk(mtmd_input_chunk_type type,
+                     std::vector<llama_token> tokens_text,
+                     mtmd_image_tokens_ptr tokens_image,
+                     mtmd_audio_tokens_ptr tokens_audio) :
+        type(type),
+        tokens_text(std::move(tokens_text)),
+        tokens_image(std::move(tokens_image)),
+        tokens_audio(std::move(tokens_audio)) {
+    }
+
     bool can_batch_with(const mtmd_input_chunk & other) const {
         if (type != other.type) {
             return false;
@@ -383,6 +420,9 @@ struct mtmd_input_chunk {
     }
 
     bool is_placeholder() const {
+        if (external) {
+            return !ext_embd || !ext_pos;
+        }
         if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
             return tokens_image && tokens_image->is_placeholder();
         } else if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
@@ -408,6 +448,17 @@ struct mtmd_input_chunk {
         ser.write(tokens_audio != nullptr);
         if (tokens_audio) {
             tokens_audio->serialize(ser);
+        }
+
+        ser.write(external);
+        if (external) {
+            ser.write(external_is_video);
+            ser.write(ext_n_tokens);
+            ser.write(ext_n_pos);
+            ser.write(ext_n_pos_per_embd);
+            ser.write<uint64_t>(ext_n_embd);
+            ser.write(ext_use_non_causal);
+            ser.write(ext_id);
         }
     }
     void deserialize(mtmd_serialization & ser) {
@@ -441,9 +492,22 @@ struct mtmd_input_chunk {
             tokens_audio.reset();
         }
 
+        external = ser.read<bool>();
+        if (external) {
+            external_is_video = ser.read<bool>();
+            ext_n_tokens = ser.read<uint32_t>();
+            ext_n_pos = ser.read<llama_pos>();
+            ext_n_pos_per_embd = ser.read<int32_t>();
+            ext_n_embd = ser.read<uint64_t>();
+            ext_use_non_causal = ser.read<bool>();
+            ext_id = ser.read<std::string>();
+            ext_embd.reset();
+            ext_pos.reset();
+        }
+
         // catch buffers where the declared type doesn't match which payload is actually present,
         // so a mismatched chunk can't slip through and null-deref/abort later in an accessor
-        if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE && !tokens_image) {
+        if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE && !tokens_image && !external) {
             throw std::runtime_error("type is IMAGE but tokens_image is missing");
         }
         if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO && !tokens_audio) {
@@ -517,12 +581,12 @@ mtmd_context_params mtmd_context_params_default() {
 }
 
 struct mtmd_context {
-    struct clip_ctx * ctx_v; // vision
-    struct clip_ctx * ctx_a; // audio
+    struct clip_ctx * ctx_v = nullptr; // vision
+    struct clip_ctx * ctx_a = nullptr; // audio
     std::vector<float> out_embd; // image embedding vector
 
     // generation context
-    struct clip_ctx * ctx_gen_a; // audio
+    struct clip_ctx * ctx_gen_a = nullptr; // audio
     std::vector<int32_t> gen_out_codes; // this frame's 16 sampled codes (GEN_CODE)
     std::vector<float>   gen_out_feats; // this frame's continuous features, if any (GEN_CODE)
     std::vector<float>   gen_out_embd;  // next-step hidden state fed back to backbone (GEN_CODE)
@@ -540,8 +604,11 @@ struct mtmd_context {
     // these are not token, but strings used to mark the beginning and end of image/audio embeddings
     std::string img_beg;
     std::string img_end;
+    std::string vid_beg;
+    std::string vid_end;
     std::string aud_beg;
     std::string aud_end;
+    std::string visiontower_url;
 
     // for llava-uhd style models, we need special tokens in-between slices
     // minicpmv calls them "slices", llama 4 calls them "tiles"
@@ -666,6 +733,50 @@ struct mtmd_context {
         }
         if (ctx_a) {
             init_audio();
+        }
+    }
+
+    mtmd_context(const llama_model * text_model,
+                 const mtmd_context_params & ctx_params) :
+        print_timings   (ctx_params.print_timings),
+        n_threads       (ctx_params.n_threads),
+        media_marker    (ctx_params.media_marker),
+        n_embd_text     (llama_model_n_embd_inp(text_model)),
+        vocab           (llama_model_get_vocab(text_model)),
+        pos_type        (MTMD_POS_TYPE_NORMAL),
+        batch_max_tokens(ctx_params.batch_max_tokens) {
+        if (ctx_params.image_marker != nullptr) {
+            throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
+        }
+        if (media_marker.empty()) {
+            throw std::runtime_error("media_marker must not be empty");
+        }
+
+        switch (llama_model_rope_type(text_model)) {
+            case LLAMA_ROPE_TYPE_NONE:
+            case LLAMA_ROPE_TYPE_NORM:
+            case LLAMA_ROPE_TYPE_NEOX:
+                pos_type = MTMD_POS_TYPE_NORMAL;
+                break;
+            case LLAMA_ROPE_TYPE_MROPE:
+            case LLAMA_ROPE_TYPE_IMROPE:
+                pos_type = MTMD_POS_TYPE_MROPE;
+                break;
+            default:
+                throw std::runtime_error("unsupported decoder rope type for external media");
+        }
+
+        const bool has_boi = lookup_token("<|begin_of_image|>") != LLAMA_TOKEN_NULL;
+        const bool has_eoi = lookup_token("<|end_of_image|>") != LLAMA_TOKEN_NULL;
+        if (has_boi && has_eoi) {
+            img_beg = "<|begin_of_image|>";
+            img_end = "<|end_of_image|>";
+        }
+        const bool has_bov = lookup_token("<|begin_of_video|>") != LLAMA_TOKEN_NULL;
+        const bool has_eov = lookup_token("<|end_of_video|>") != LLAMA_TOKEN_NULL;
+        if ((has_bov && has_eov) || (has_boi && has_eoi)) {
+            vid_beg = "<|begin_of_video|>";
+            vid_end = "<|end_of_video|>";
         }
     }
 
@@ -940,6 +1051,13 @@ struct mtmd_context {
                     img_end = "<|end_of_image|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_GLM5NEXT:
+                {
+                    // glm5next spells video with its own token pair, but video is not supported here
+                    img_beg = "<|begin_of_image|>";
+                    img_end = "<|end_of_image|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_glm5next>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_GLM5V:
                 {
                     // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
@@ -1132,6 +1250,8 @@ struct mtmd_context {
             return clip_n_mmproj_embd(ctx_v);
         } else if (ctx_a) {
             return clip_n_mmproj_embd(ctx_a);
+        } else if (n_embd_text > 0) {
+            return n_embd_text;
         } else {
             throw std::runtime_error("no CLIP model loaded");
         }
@@ -1188,8 +1308,31 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
     }
 }
 
+mtmd_context * mtmd_init_from_text_model(const struct llama_model * text_model,
+        const struct mtmd_context_params ctx_params) {
+    try {
+        if (!text_model) {
+            throw std::runtime_error("text_model must not be null");
+        }
+        return new mtmd_context(text_model, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+void mtmd_set_visiontower_url(mtmd_context * ctx, const char * url) {
+    if (ctx) {
+        ctx->visiontower_url = url ? url : "";
+    }
+}
+
+const char * mtmd_get_visiontower_url(const mtmd_context * ctx) {
+    return ctx ? ctx->visiontower_url.c_str() : nullptr;
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {
@@ -1203,6 +1346,11 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
             LOG_DBG("%s: merging 2 frames at part index %zu and %zu\n", __func__, i, i + 1);
             output.push_back({parts[i].bitmap, parts[i + 1].bitmap});
             parts.erase(parts.begin() + i + 1);
+            continue;
+        }
+        if (n_merge == 2 && parts[i].bitmap->can_merge_with(*parts[i].bitmap)) {
+            LOG_DBG("%s: padding final frame at part index %zu\n", __func__, i);
+            output.push_back({parts[i].bitmap, parts[i].bitmap});
             continue;
         }
         LOG_DBG("%s: no merging for part index %zu\n", __func__, i);
@@ -1432,6 +1580,43 @@ struct mtmd_tokenizer {
 
     int32_t add_media(std::vector<const mtmd_bitmap *> & bitmaps) {
         GGML_ASSERT(!bitmaps.empty());
+
+        if (bitmaps[0]->is_external) {
+            if (bitmaps.size() != 1) {
+                LOG_ERR("%s: external media cannot be temporally merged\n", __func__);
+                return 2;
+            }
+            const auto * bitmap = bitmaps[0];
+            const std::string & beg = bitmap->is_video ? ctx->vid_beg : ctx->img_beg;
+            const std::string & end = bitmap->is_video ? ctx->vid_end : ctx->img_end;
+            if (!beg.empty()) {
+                add_text(beg, true);
+            }
+
+            mtmd_input_chunk chunk{
+                MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                {},
+                nullptr,
+                nullptr,
+            };
+            chunk.external = true;
+            chunk.external_is_video = bitmap->is_video;
+            chunk.ext_n_tokens = bitmap->ext_n_tokens;
+            chunk.ext_n_pos = bitmap->ext_n_pos;
+            chunk.ext_n_pos_per_embd = bitmap->ext_n_pos_per_embd;
+            chunk.ext_n_embd = bitmap->ext_n_embd;
+            chunk.ext_use_non_causal = bitmap->ext_use_non_causal;
+            chunk.ext_id = bitmap->id;
+            chunk.ext_embd = bitmap->ext_embd;
+            chunk.ext_pos = bitmap->ext_pos;
+            cur.entries.emplace_back(std::move(chunk));
+
+            if (!end.empty()) {
+                add_text(end, true);
+            }
+            n_images_added++;
+            return 0;
+        }
 
         // note: only one type of media is supported per call, caller should enforce this
         const bool is_vision = !bitmaps[0]->is_audio;
@@ -1985,6 +2170,13 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
         return 0;
+    } else if (chunk->external) {
+        if (!chunk->ext_embd || !chunk->ext_pos) {
+            LOG_ERR("%s: external media chunk is a placeholder\n", __func__);
+            return 1;
+        }
+        out_embd = *chunk->ext_embd;
+        return 0;
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
         if (!ctx->ctx_v) {
             LOG_ERR("%s: model does not support vision input\n", __func__);
@@ -2240,6 +2432,21 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
         return 1;
     }
 
+    if (chunk->external) {
+        if (chunk->is_placeholder()) {
+            LOG_ERR("%s: external chunk is a placeholder\n", __func__);
+            return 1;
+        }
+        if (batch->entries.empty()) {
+            batch->entries.push_back(chunk);
+            return 0;
+        }
+        return 3;
+    }
+    if (!batch->entries.empty() && batch->entries[0]->external) {
+        return 3;
+    }
+
     auto * ctx = batch->ctx->get_clip_ctx(chunk);
     if (!ctx) {
         LOG_ERR("%s: model does not support input chunk type %d\n", __func__, (int)chunk->type);
@@ -2281,6 +2488,15 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
             LOG_ERR("%s: chunk is placeholder\n", __func__);
             return 1;
         }
+    }
+
+    if (batch->entries[0]->external) {
+        if (batch->entries.size() != 1 || !batch->entries[0]->ext_embd) {
+            LOG_ERR("%s: external media batches must contain exactly one populated chunk\n", __func__);
+            return 1;
+        }
+        batch->output_embd = *batch->entries[0]->ext_embd;
+        return 0;
     }
 
     // represent the whole batch as one single chunk
@@ -2338,8 +2554,8 @@ float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * 
         return nullptr;
     }
     size_t offset = 0;
-    const size_t n_embd = batch->ctx->n_embd_out();
     for (const auto * c : batch->entries) {
+        const size_t n_embd = c->external ? c->ext_n_embd : batch->ctx->n_embd_out();
         size_t offset_prev = offset;
         size_t n_tokens = mtmd_input_chunk_get_n_tokens(c);
         offset += n_tokens * n_embd;
@@ -2353,6 +2569,9 @@ float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * 
 }
 
 bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+    if (chunk && chunk->external) {
+        return chunk->ext_use_non_causal;
+    }
     auto proj_type = ctx->proj_type_v();
     if (chunk && chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         proj_type = ctx->proj_type_a();
@@ -2417,6 +2636,34 @@ mtmd_bitmap * mtmd_bitmap_init_from_audio(size_t n_samples,
     if (!bitmap->is_placeholder()) {
         GGML_ASSERT(bitmap->get_ro_buf().size() == n_samples * sizeof(float));
     }
+    return bitmap;
+}
+
+mtmd_bitmap * mtmd_bitmap_init_from_embd(uint32_t n_tokens,
+                                         llama_pos n_pos,
+                                         int32_t n_pos_per_embd,
+                                         const float * embd,
+                                         size_t n_embd,
+                                         const llama_pos * pos,
+                                         bool is_video,
+                                         bool use_non_causal) {
+    if (!embd || !pos || n_tokens == 0 || n_pos <= 0 || n_pos_per_embd <= 0 || n_embd == 0
+            || n_embd > std::numeric_limits<size_t>::max() / n_tokens
+            || (size_t) n_pos_per_embd > std::numeric_limits<size_t>::max() / n_tokens) {
+        return nullptr;
+    }
+    auto * bitmap = new mtmd_bitmap(nullptr, 0, 0);
+    bitmap->is_external = true;
+    bitmap->is_video = is_video;
+    bitmap->ext_n_tokens = n_tokens;
+    bitmap->ext_n_pos = n_pos;
+    bitmap->ext_n_pos_per_embd = n_pos_per_embd;
+    bitmap->ext_n_embd = n_embd;
+    bitmap->ext_use_non_causal = use_non_causal;
+    bitmap->ext_embd = std::make_shared<std::vector<float>>((size_t) n_tokens * n_embd);
+    std::memcpy(bitmap->ext_embd->data(), embd, bitmap->ext_embd->size() * sizeof(float));
+    bitmap->ext_pos = std::make_shared<std::vector<llama_pos>>((size_t) n_tokens * n_pos_per_embd);
+    std::memcpy(bitmap->ext_pos->data(), pos, bitmap->ext_pos->size() * sizeof(llama_pos));
     return bitmap;
 }
 
@@ -2528,6 +2775,8 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
 size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         return chunk->tokens_text.size();
+    } else if (chunk->external) {
+        return chunk->ext_n_tokens;
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
         return mtmd_image_tokens_get_n_tokens(chunk->tokens_image.get());
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
@@ -2540,6 +2789,8 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
 llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         return chunk->tokens_text.size();
+    } else if (chunk->external) {
+        return chunk->ext_n_pos;
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
         return mtmd_image_tokens_get_n_pos(chunk->tokens_image.get());
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
@@ -2551,11 +2802,34 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
 
 const char * mtmd_input_chunk_get_id(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        if (chunk->external) {
+            return chunk->ext_id.empty() ? nullptr : chunk->ext_id.c_str();
+        }
         return chunk->tokens_image->id.c_str();
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         return chunk->tokens_audio->id.c_str();
     }
     return nullptr;
+}
+
+const float * mtmd_input_chunk_get_embd(const mtmd_input_chunk * chunk) {
+    return chunk && chunk->ext_embd ? chunk->ext_embd->data() : nullptr;
+}
+
+size_t mtmd_input_chunk_get_n_embd(const mtmd_input_chunk * chunk) {
+    return chunk && chunk->external ? chunk->ext_n_embd : 0;
+}
+
+const llama_pos * mtmd_input_chunk_get_pos(const mtmd_input_chunk * chunk) {
+    return chunk && chunk->ext_pos ? chunk->ext_pos->data() : nullptr;
+}
+
+int32_t mtmd_input_chunk_get_n_pos_per_embd(const mtmd_input_chunk * chunk) {
+    return chunk && chunk->external ? chunk->ext_n_pos_per_embd : 0;
+}
+
+bool mtmd_input_chunk_get_use_non_causal(const mtmd_input_chunk * chunk) {
+    return chunk && chunk->external && chunk->ext_use_non_causal;
 }
 
 mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk) {
@@ -2565,6 +2839,16 @@ mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk) {
         nullptr,
         nullptr,
     };
+    copy->external = chunk->external;
+    copy->external_is_video = chunk->external_is_video;
+    copy->ext_n_tokens = chunk->ext_n_tokens;
+    copy->ext_n_pos = chunk->ext_n_pos;
+    copy->ext_n_pos_per_embd = chunk->ext_n_pos_per_embd;
+    copy->ext_n_embd = chunk->ext_n_embd;
+    copy->ext_use_non_causal = chunk->ext_use_non_causal;
+    copy->ext_id = chunk->ext_id;
+    copy->ext_embd = chunk->ext_embd;
+    copy->ext_pos = chunk->ext_pos;
     if (chunk->tokens_image) {
         // copy the image tokens
         copy->tokens_image = mtmd_image_tokens_ptr(new mtmd_image_tokens());
@@ -2831,6 +3115,25 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
         nullptr, // audio tokens
     };
     chunks->entries.emplace_back(std::move(chunk_image));
+
+    // create an externally encoded image chunk
+    mtmd_input_chunk chunk_external{
+        MTMD_INPUT_CHUNK_TYPE_IMAGE,
+        {},
+        nullptr,
+        nullptr,
+    };
+    chunk_external.external = true;
+    chunk_external.external_is_video = true;
+    chunk_external.ext_n_tokens = 2;
+    chunk_external.ext_n_pos = 2;
+    chunk_external.ext_n_pos_per_embd = 4;
+    chunk_external.ext_n_embd = 3;
+    chunk_external.ext_use_non_causal = true;
+    chunk_external.ext_id = "external_1";
+    chunk_external.ext_embd = std::make_shared<std::vector<float>>(6, 0.5f);
+    chunk_external.ext_pos = std::make_shared<std::vector<llama_pos>>(8, 0);
+    chunks->entries.emplace_back(std::move(chunk_external));
 
     return chunks;
 }
