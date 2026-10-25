@@ -53,5 +53,16 @@ int main() {
 
     CHECK(stats.configure(46, 288));
     CHECK(!stats.configure(64, 512));
+    CHECK(stats.configure(2, 4));
+    const int32_t weighted_ids[] = { 1, 3 };
+    const float weights[] = { 0.25f, 0.75f };
+    CHECK(stats.add(0, weighted_ids, 2, 1, weights));
+    CHECK(stats.layers().at(0).q1_rows == 1);
+    CHECK(stats.layers().at(0).multi_rows == 0);
+    CHECK(stats.layers().at(0).q1_hits[3] == 1);
+    CHECK(stats.layers().at(0).weight_sums[3] == 0.75);
+    const auto json = stats.snapshot_json("target");
+    CHECK(json.find("\"hits\":[0,1,0,1]") != std::string::npos);
+    CHECK(json.find("\"applied_weight_sums\":[0,0.25,0,0.75]") != std::string::npos);
     return 0;
 }

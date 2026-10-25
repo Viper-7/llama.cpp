@@ -93,6 +93,37 @@ void server_queue::defer(server_task && task) {
     condition_tasks.notify_one();
 }
 
+void server_queue::defer_prefix(server_task && task) {
+    std::lock_guard<std::mutex> lock(mutex_tasks);
+    queue_tasks_prefix.push_back(std::move(task));
+}
+
+void server_queue::poll_prefix() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_tasks);
+        std::stable_sort(queue_tasks_prefix.begin(), queue_tasks_prefix.end(), [](const auto & a, const auto & b) {
+            return a.params.execution_priority > b.params.execution_priority;
+        });
+        while (!queue_tasks_prefix.empty()) {
+            queue_tasks.push_back(std::move(queue_tasks_prefix.front()));
+            queue_tasks_prefix.pop_front();
+        }
+    }
+    // Recheck before dispatch, so blocked followers do not interrupt an
+    // independent decode continuation window as pending control work.
+    process_new_tasks(false);
+}
+
+int server_queue::prefix_priority(int producer, int priority) {
+    std::lock_guard<std::mutex> lock(mutex_tasks);
+    for (const auto * queue : {&queue_tasks_prefix, &queue_tasks}) {
+        for (const auto & task : *queue) {
+            if (task.prefix_producer == producer) priority = std::max(priority, task.params.execution_priority);
+        }
+    }
+    return priority;
+}
+
 int server_queue::get_new_id() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     int new_id = id++;
@@ -140,6 +171,19 @@ void server_queue::wait_until_no_sleep() {
             return !sleeping;
         });
     }
+}
+
+bool server_queue::has_pending_control_tasks() {
+    std::lock_guard<std::mutex> lock(mutex_tasks);
+    auto control = [](const server_task & task) {
+        return task.type != SERVER_TASK_TYPE_NEXT_RESPONSE &&
+               task.type != SERVER_TASK_TYPE_METRICS &&
+               task.type != SERVER_TASK_TYPE_SLOT_GET &&
+               task.type != SERVER_TASK_TYPE_RESPONSES_CONTEXT;
+    };
+    return !running ||
+        std::any_of(queue_tasks.begin(), queue_tasks.end(), control) ||
+        std::any_of(queue_tasks_unhandled.begin(), queue_tasks_unhandled.end(), control);
 }
 
 void server_queue::terminate() {
@@ -389,6 +433,9 @@ void server_queue::cleanup_pending_task(int id_target) {
     queue_tasks_deferred.erase(
         std::remove_if(queue_tasks_deferred.begin(),  queue_tasks_deferred.end(),  rm_func),
         queue_tasks_deferred.end());
+    queue_tasks_prefix.erase(
+        std::remove_if(queue_tasks_prefix.begin(), queue_tasks_prefix.end(), rm_func),
+        queue_tasks_prefix.end());
     // a task declined while yielding is not in queue_tasks yet, but it can still be cancelled
     queue_tasks_unhandled.erase(
         std::remove_if(queue_tasks_unhandled.begin(), queue_tasks_unhandled.end(), rm_func),

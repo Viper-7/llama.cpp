@@ -12,8 +12,16 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-context.h"
+#include "../src/llama-kv-cache-kpool.h"
+#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-memory-recurrent.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -563,7 +571,7 @@ static void test_glm5next_fa_cache_types(llama_model * model) {
 }
 
 static void test_glm5next_native_f16_chunk_graph(
-        llama_model * model, const std::vector<llama_token> & tokens) {
+        llama_model * model, const std::vector<llama_token> & tokens, uint32_t sequences = 1) {
     scoped_env_var turbo3_mla("LLAMA_GLM5NEXT_TURBO3_MLA", "0");
     scoped_env_var segmented("LLAMA_GLM5NEXT_SPARSE_SEGMENTED", "1");
     scoped_env_var query_chunk("LLAMA_GLM5NEXT_SPARSE_QUERY_CHUNK", "14");
@@ -571,6 +579,8 @@ static void test_glm5next_native_f16_chunk_graph(
 
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 32768;
+    params.n_seq_max = sequences;
+    params.kv_unified = true;
     params.n_threads = 4;
     params.n_threads_batch = 4;
     params.n_ubatch = 256;
@@ -608,10 +618,11 @@ static void test_glm5next_native_f16_chunk_graph(
     }
 
     const auto decode_batch = [&](llama_context * ctx, uint32_t pos0, bool all_logits) {
-        constexpr uint32_t count = 256;
+        const bool mixed = sequences > 1 && pos0 >= 3584;
+        const uint32_t count = mixed ? 252 : 256;
         llama_batch batch = llama_batch_init(count, 0, 1);
         for (uint32_t i = 0; i < count; ++i) {
-            common_batch_add(batch, tokens[(pos0 + i) % tokens.size()], pos0 + i, { 0 },
+            common_batch_add(batch, tokens[(pos0 + i) % tokens.size()], pos0 + (mixed ? i/sequences : i), { mixed ? (llama_seq_id) (i % sequences) : 0 },
                     all_logits || i + 1 == count);
         }
         if (llama_decode(ctx, batch)) {
@@ -642,6 +653,11 @@ static void test_glm5next_native_f16_chunk_graph(
         throw std::runtime_error("GLM5Next native F16 query chunks activated below their configured width");
     }
 
+    for (uint32_t seq = 1; seq < sequences; ++seq) {
+        for (auto * ctx : {chunked.get(), dense_f16.get(), dense_f32.get()}) {
+            llama_memory_seq_cp(llama_get_memory(ctx), 0, seq, -1, -1);
+        }
+    }
     dense_f16_probe = { true, 0 };
     dense_f32_probe = { true, 0 };
     const std::vector<float> logits_chunked = decode_batch(chunked.get(), 3584, true);
@@ -871,6 +887,566 @@ static void test_glm5next_failed_state_restore_cleanup(
     const std::vector<float> logits_ref = get_logits(model, fresh.get(), probe);
     if (logits_dst != logits_ref) {
         throw std::runtime_error("failed GLM5Next state restore left the destination memory dirty");
+    }
+}
+
+static void test_glm5next_restored_prefix_sharing(llama_model * model, const std::vector<llama_token> & tokens) {
+    scoped_env_var chunks("LLAMA_GLM5NEXT_SPARSE_QUERY_CHUNK", "14");
+    scoped_env_var segmented("LLAMA_GLM5NEXT_SPARSE_SEGMENTED", "1");
+    auto make_context = [&](uint32_t sequences) {
+        auto p = llama_context_default_params();
+        p.n_ctx = sequences == 1 ? 1024 : 2048; p.n_seq_max = sequences; p.kv_unified = sequences > 1;
+        p.n_batch = 64; p.n_ubatch = 64; p.n_threads = 2; p.n_threads_batch = 2;
+        p.type_k = GGML_TYPE_F16; p.type_v = GGML_TYPE_F16;
+        p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context_ptr c(llama_init_from_model(model, p));
+        if (!c) { throw std::runtime_error("restored-prefix context failed"); }
+        return c;
+    };
+    auto shared = make_context(3);
+    std::vector<llama_context_ptr> references;
+    const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto step = [&](llama_context * ctx, int seq, int pos, int token_offset) {
+        llama_batch b = llama_batch_init(1, 0, 1);
+        common_batch_add(b, tokens[(pos + token_offset) % tokens.size()], pos, {seq}, true);
+        const int code = llama_decode(ctx, b); llama_batch_free(b);
+        if (code) { throw std::runtime_error("restored-prefix step failed"); }
+        const float * v = llama_get_logits_ith(ctx, 0);
+        return std::vector<float>(v, v + nv);
+    };
+    // Independent restored endpoints already diverge beyond the common 200.
+    for (int seq = 0; seq < 3; ++seq) {
+        references.push_back(make_context(1));
+        for (int pos = 0; pos < 200 + seq * 2; ++pos) {
+            step(references.back().get(), 0, pos, pos < 200 ? 0 : seq + 1);
+        }
+        auto * ref = references.back().get();
+        std::vector<uint8_t> state(llama_state_seq_get_size(ref, 0));
+        if (llama_state_seq_get_data(ref, state.data(), state.size(), 0) != state.size() ||
+                llama_state_seq_set_data(shared.get(), state.data(), state.size(), seq) != state.size()) {
+            throw std::runtime_error("restored-prefix state import failed");
+        }
+    }
+    auto * memory = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(shared.get()));
+    if (!memory || memory->get_mem_attn()->get_cells(0).get_used() != 606) {
+        throw std::runtime_error("independent restore occupancy mismatch");
+    }
+    const std::vector<std::pair<llama_seq_id, uint32_t>> budgets{{0, 800}, {1, 800}, {2, 800}};
+    if (llama_glm5next_reserved_cells(shared.get(), budgets) != 2400) {
+        throw std::runtime_error("unshared admission did not reserve all tails");
+    }
+    if (llama_glm5next_share_prefix(shared.get(), 0, 1, 201)) {
+        throw std::runtime_error("incomplete source accepted for prefix sharing");
+    }
+    if (!llama_glm5next_share_prefix(shared.get(), 0, 1, 200) ||
+            !llama_glm5next_share_prefix(shared.get(), 0, 2, 200)) {
+        throw std::runtime_error("restored-prefix sharing rejected");
+    }
+    if (memory->get_mem_attn()->get_cells(0).get_used() != 206 ||
+            memory->get_mem_idx()->get_cells(0).get_used() != 206) {
+        throw std::runtime_error("prefix sharing did not release duplicate physical cells");
+    }
+    if (llama_glm5next_reserved_cells(shared.get(), budgets) != 2000) {
+        throw std::runtime_error("shared admission did not subtract proven duplicate cells");
+    }
+    for (int round = 0; round < 12; ++round) {
+        // Free the original donor; both borrowers must retain the shared cells.
+        if (round == 6) { llama_memory_seq_rm(llama_get_memory(shared.get()), 0, -1, -1); }
+        for (int seq = round >= 6 ? 1 : 0; seq < 3; ++seq) {
+            const int pos = 200 + seq * 2 + round;
+            auto actual = step(shared.get(), seq, pos, seq + 1);
+            auto expected = step(references[seq].get(), 0, pos, seq + 1);
+            const double error = nmse(actual, expected);
+            if (!std::isfinite(error) || error > 1e-6) {
+                throw std::runtime_error("prefix sharing corrupted divergent recurrent state or donor removal");
+            }
+        }
+    }
+    {
+        auto seeded = make_context(3);
+        auto reference = make_context(1);
+        for (int pos = 0; pos < 204; ++pos) {
+            if (pos < 200) step(seeded.get(), 0, pos, 0);
+            step(reference.get(), 0, pos, pos < 200 ? 0 : 7);
+        }
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(seeded.get()));
+        if (llama_glm5next_seed_prefix(seeded.get(), 0, 1, 201) ||
+                !llama_glm5next_seed_prefix(seeded.get(), 0, 1, 128) ||
+                llama_glm5next_seed_prefix(seeded.get(), 0, 1, 128)) {
+            throw std::runtime_error("resident prefix accepted incomplete/nonempty history or rejected exact empty destination");
+        }
+        if (hybrid->get_mem_recr()->seq_pos_max(1) != -1 ||
+                hybrid->get_mem_attn()->get_cells(0).get_used() != 200) {
+            throw std::runtime_error("resident seed copied recurrent state or allocated duplicate prefix cells");
+        }
+        const size_t size = llama_state_seq_get_size_range_ext(reference.get(), 0, 128, 204, LLAMA_STATE_SEQ_FLAGS_NONE);
+        std::vector<uint8_t> suffix(size);
+        if (!size || llama_state_seq_get_data_range_ext(reference.get(), suffix.data(), size, 0, 128, 204,
+                    LLAMA_STATE_SEQ_FLAGS_NONE) != size ||
+                llama_state_seq_set_data_ext(seeded.get(), suffix.data(), size, 1, LLAMA_STATE_SEQ_FLAGS_NONE) != size) {
+            throw std::runtime_error("range suffix import after resident seed failed");
+        }
+        if (hybrid->get_mem_attn()->get_cells(0).get_used() != 276 ||
+                hybrid->get_mem_idx()->get_cells(0).get_used() != 276) {
+            throw std::runtime_error("resident seed plus range import occupancy mismatch");
+        }
+        llama_memory_seq_rm(llama_get_memory(seeded.get()), 0, -1, -1);
+        for (int pos = 204; pos < 212; ++pos) {
+            auto actual = step(seeded.get(), 1, pos, 7);
+            auto expected = step(reference.get(), 0, pos, 7);
+            const double error = nmse(actual, expected);
+            if (!std::isfinite(error) || error > 1e-6) {
+                throw std::runtime_error("resident seed changed divergent recurrence or donor-removal continuation");
+            }
+        }
+        fprintf(stderr, "resident prefix: suffix-only restore, divergent recurrent endpoint and donor removal pass\n");
+    }
+
+}
+
+
+// A private request's scoring geometry must not depend on an idle foreign head,
+// or on where its own shared cells happen to sit in the physical stream.
+static void test_glm5next_logical_attention_span(llama_model * model, const std::vector<llama_token> & tokens) {
+    auto params = llama_context_default_params();
+    params.n_ctx = 1024;
+    params.n_seq_max = 2;
+    params.kv_unified = true;
+    params.n_batch = 64;
+    params.n_ubatch = 16;
+    params.n_threads = params.n_threads_batch = 2;
+    params.type_k = params.type_v = GGML_TYPE_F16;
+    llama_context_ptr occupied(llama_init_from_model(model, params));
+    llama_context_ptr isolated(llama_init_from_model(model, params));
+    if (!occupied || !isolated) throw std::runtime_error("logical span owner allocation failed");
+    auto lane = occupied->create_execution_lane(16, 64);
+    auto reference = isolated->create_execution_lane(16, 64);
+    auto decode = [&](llama_context * ctx, int seq, int pos, int count) {
+        auto batch = llama_batch_init(count, 0, 1);
+        for (int i = 0; i < count; ++i) {
+            common_batch_add(batch, tokens[(pos + i + seq * 7) % tokens.size()], pos + i, {seq}, i == count - 1);
+        }
+        const int result = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (result) throw std::runtime_error("logical span decode failed");
+        const auto * logits = llama_get_logits_ith(ctx, -1);
+        return std::vector<float>(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(model)));
+    };
+    for (int pos = 0; pos < 384; pos += 16) decode(occupied.get(), 0, pos, 16);
+    uint32_t expected_span = 256;
+    int checked = 0;
+    bool saw_foreign_span = false;
+    bool saw_logical_growth = false;
+    lane->set_execution_input_validator([&](const llm_graph_result & graph) {
+        for (const auto & input : graph.inputs) {
+            auto * pool = dynamic_cast<llm_graph_input_kpool *>(input.get());
+            if (!pool || !pool->pool_bias) continue;
+            const auto physical = pool->mctx_attn->get_n_kv();
+            if (pool->attention_span != expected_span ||
+                    pool->pool_bias->ne[0] != llama_kpool_n_pools(expected_span, model->hparams.indexer_kpool)) {
+                throw std::runtime_error("foreign occupancy or stale topology expanded private scoring");
+            }
+            saw_foreign_span |= physical > expected_span;
+            saw_logical_growth |= expected_span == 512 && physical == 1024;
+            ++checked;
+        }
+    });
+    auto compare = [&](int pos, uint32_t span) {
+        expected_span = span;
+        const auto actual = decode(lane.get(), 1, pos, 16);
+        const auto wanted = decode(reference.get(), 1, pos, 16);
+        const double error = nmse(actual, wanted);
+        if (!std::isfinite(error) || error > 1e-6) {
+            throw std::runtime_error("logical attention span changed isolated/shared logits");
+        }
+    };
+    for (int pos = 0; pos < 320; pos += 16) {
+        if (pos == 64) {
+            // Grow the foreign sequence after private graphs already exist.
+            for (int other = 384; other < 512; other += 16) decode(occupied.get(), 0, other, 16);
+        }
+        compare(pos, pos < 256 ? 256 : 512);
+    }
+    if (!llama_memory_seq_rm(occupied->get_memory(), 0, -1, -1)) {
+        throw std::runtime_error("foreign sequence removal failed");
+    }
+    compare(320, 512); // surviving private cells are physically fragmented
+    for (auto * owner : {occupied.get(), isolated.get()}) {
+        llama_memory_seq_add(owner->get_memory(), 1, 0, -1, 256);
+    }
+    compare(592, 512); // shifted logical origin must not enlarge the range
+    for (auto * owner : {occupied.get(), isolated.get()}) {
+        llama_memory_seq_add(owner->get_memory(), 1, 512, -1, 32);
+    }
+    compare(640, 512); // retain pools across an interior logical hole
+    if (checked < 20 || !saw_foreign_span || !saw_logical_growth) {
+        throw std::runtime_error("logical span regression did not exercise foreign occupancy and reuse boundary");
+    }
+    fprintf(stderr, "logical attention span: foreign heads, topology growth, fragmentation, rebase and hole pass\n");
+}
+
+// This gate proves storage/lifetime isolation, not simultaneous GPU execution.
+static void test_glm5next_recurrent_no_alloc(llama_model * model) {
+    struct restore_flag {
+        bool & value;
+        bool previous;
+        ~restore_flag() { value = previous; }
+    } restore{model->hparams.no_alloc, model->hparams.no_alloc};
+    const auto filter = [](int layer) { return layer == 0; };
+    model->hparams.no_alloc = false;
+    std::map<ggml_backend_buffer_type_t, size_t> physical;
+    {
+        llama_memory_recurrent real(*model, GGML_TYPE_F32, GGML_TYPE_F32, false, 3, 3, 0, filter);
+        physical = real.memory_breakdown();
+        if (!real.r_l[0] || !real.r_l[0]->buffer ||
+                ggml_backend_buffer_get_size(real.r_l[0]->buffer) == 0) {
+            throw std::runtime_error("normal recurrent allocation was not exercised");
+        }
+    }
+    model->hparams.no_alloc = true;
+    llama_memory_recurrent planned(*model, GGML_TYPE_F32, GGML_TYPE_F32, false, 3, 3, 0, filter);
+    for (const auto & tensors : {planned.r_l, planned.s_l, planned.p_l}) {
+        for (auto * tensor : tensors) {
+            if (tensor && (!tensor->buffer || ggml_backend_buffer_get_size(tensor->buffer) != 0 ||
+                    ggml_backend_buffer_get_base(tensor->buffer) != nullptr || tensor->data != nullptr)) {
+                throw std::runtime_error("no_alloc recurrent cache allocated physical tensor storage");
+            }
+        }
+    }
+    if (planned.memory_breakdown() != physical || physical.empty()) {
+        throw std::runtime_error("no_alloc recurrent estimate differs from physical allocation");
+    }
+    fprintf(stderr, "recurrent no_alloc: zero physical bytes, exact allocation estimate\n");
+}
+
+static void test_glm5next_execution_lane_storage(llama_model * model, const std::vector<llama_token> & tokens) {
+    auto params = llama_context_default_params();
+    params.n_ctx = 1024;
+    constexpr int prefix = 301;
+    int owned_pool_checks = 0;
+    params.n_seq_max = 3;
+    params.kv_unified = true;
+    params.n_batch = 64;
+    params.n_ubatch = 16;
+    params.n_threads = params.n_threads_batch = 2;
+    params.type_k = params.type_v = GGML_TYPE_F16;
+    llama_context_ptr owner(llama_init_from_model(model, params));
+    if (!owner) throw std::runtime_error("execution lane owner allocation failed");
+    auto step = [&](llama_context * ctx, int seq, int pos, llama_token token) {
+        auto batch = llama_batch_init(1, 0, 1);
+        common_batch_add(batch, token, pos, {seq}, true);
+        ctx->set_execution_input_validator([&](const llm_graph_result & graph) {
+        if (pos >= prefix) {
+            auto * hybrid = dynamic_cast<llama_memory_hybrid *>(ctx->get_memory());
+            const auto & cells = hybrid->get_mem_idx()->get_cells(seq);
+            for (const auto & input : graph.inputs) {
+                auto * pool = dynamic_cast<llm_graph_input_kpool *>(input.get());
+                if (!pool || !pool->new_pool_reps) continue;
+                std::vector<int64_t> writes(ggml_nelements(pool->new_pool_reps));
+                ggml_backend_tensor_get(pool->new_pool_reps, writes.data(), 0, writes.size()*sizeof(int64_t));
+                for (const auto cell : writes) {
+                    if (cell < 0 || (uint64_t) cell >= hybrid->get_mem_idx()->get_size() ||
+                            !cells.seq_has(cell, seq) || cells.seq_count(cell) != 1 || cells.pos_get(cell) < prefix) {
+                        throw std::runtime_error("execution lane pooled-key padding writes a shared/foreign cell");
+                    }
+                }
+                std::vector<int32_t> reads(ggml_nelements(pool->pool_reps));
+                ggml_backend_tensor_get(pool->pool_reps, reads.data(), 0, reads.size()*sizeof(int32_t));
+                for (const auto cell : reads) {
+                    if (cell < 0 || (uint64_t) cell >= hybrid->get_mem_idx()->get_size() || !cells.seq_has(cell, seq)) {
+                        throw std::runtime_error("execution lane pooled-key padding reads invalid/foreign cell " + std::to_string(cell));
+                    }
+                }
+                ++owned_pool_checks;
+            }
+        }
+        });
+        const int result = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (result) throw std::runtime_error("execution lane decode failed");
+        const auto * logits = llama_get_logits_ith(ctx, 0);
+        return std::vector<float>(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(model)));
+    };
+    params.n_seq_max = 1;
+    std::vector<llama_context_ptr> refs;
+    for (int s = 0; s < 3; ++s) {
+        refs.emplace_back(llama_init_from_model(model, params));
+        if (!refs.back()) throw std::runtime_error("execution lane reference allocation failed");
+    }
+    for (int p = 0; p < prefix; ++p) {
+        step(owner.get(), 0, p, tokens[p % tokens.size()]);
+        for (auto & ref : refs) step(ref.get(), 0, p, tokens[p % tokens.size()]);
+    }
+    llama_memory_seq_cp(owner->get_memory(), 0, 1, -1, -1);
+    llama_memory_seq_cp(owner->get_memory(), 0, 2, -1, -1);
+    auto lane1 = owner->create_execution_lane(8, 64);
+    auto lane2 = owner->create_execution_lane(16, 64);
+    if (owner->get_memory() != lane1->get_memory() || owner->get_memory() != lane2->get_memory() ||
+            owner->get_sched() == lane1->get_sched() || lane1->get_sched() == lane2->get_sched()) {
+        throw std::runtime_error("execution lanes did not share KV with private schedulers");
+    }
+    auto initial_lane = owner->create_execution_lane(64);
+    std::vector<std::pair<llama_context *, llama_batch>> initial;
+    llama_context * initial_lanes[] = {initial_lane.get(), lane1.get(), lane2.get()};
+    for (int seq = 0; seq < 3; ++seq) {
+        auto batch = llama_batch_init(1, 0, 1);
+        common_batch_add(batch, tokens[(prefix + seq * 13) % tokens.size()], prefix, {seq}, true);
+        initial.emplace_back(initial_lanes[seq], batch);
+    }
+    const auto initial_result = owner->decode_execution_wave(initial);
+    if (owner->get_last_execution_wave_lanes() != 3) throw std::runtime_error("shared endpoint wave used serial fallback");
+    for (int seq = 0; seq < 3; ++seq) {
+        llama_batch_free(initial[seq].second);
+        if (initial_result[seq]) throw std::runtime_error("shared endpoint execution wave failed");
+        auto expected = step(refs[seq].get(), 0, prefix, tokens[(prefix + seq * 13) % tokens.size()]);
+        const auto * logits = llama_get_logits_ith(initial_lanes[seq], 0);
+        const double error = nmse(std::vector<float>(logits, logits + expected.size()), expected);
+        if (!std::isfinite(error) || error > 1e-6) throw std::runtime_error("shared endpoint wave changed logits");
+    }
+    for (int p = prefix + 1; p < prefix + 8; ++p) {
+        llama_context * lanes[] = {owner.get(), lane1.get(), lane2.get()};
+        for (int seq = 0; seq < 3; ++seq) {
+            const auto token = tokens[(p + seq * 13) % tokens.size()];
+            auto actual = step(lanes[seq], seq, p, token);
+            auto expected = step(refs[seq].get(), 0, p, token);
+            const double error = nmse(actual, expected);
+            if (!std::isfinite(error) || error > 1e-6) {
+                throw std::runtime_error("execution lane changed divergent sequence logits");
+            }
+        }
+    }
+
+    auto lane0 = owner->create_execution_lane(64);
+    llama_context * independent[] = {lane0.get(), lane1.get(), lane2.get()};
+    int positions[] = {prefix + 8, prefix + 8, prefix + 8};
+    for (auto * lane : independent) lane->set_execution_input_validator({});
+    for (int wave = 0; wave < 4; ++wave) {
+        std::vector<std::pair<llama_context *, llama_batch>> work;
+        std::vector<std::vector<float>> expected(3);
+        for (int seq = 0; seq < 3; ++seq) {
+            const int count = 1 + 2 * ((seq + wave) % 3);
+            auto batch = llama_batch_init(count, 0, 1);
+            for (int j = 0; j < count; ++j) {
+                const int pos = positions[seq]++;
+                const auto token = tokens[(pos + seq * 13) % tokens.size()];
+                common_batch_add(batch, token, pos, {seq}, j == count - 1);
+                expected[seq] = step(refs[seq].get(), 0, pos, token);
+            }
+            work.emplace_back(independent[seq], batch);
+        }
+        const auto result = owner->decode_execution_wave(work);
+        if (owner->get_last_execution_wave_lanes() != 3) throw std::runtime_error("execution wave used serial fallback");
+        for (int seq = 0; seq < 3; ++seq) {
+            llama_batch_free(work[seq].second);
+            if (result[seq]) throw std::runtime_error("independent execution wave failed");
+            const auto * logits = llama_get_logits_ith(independent[seq], -1);
+            const std::vector<float> actual(logits, logits + expected[seq].size());
+            const double error = nmse(actual, expected[seq]);
+            if (!std::isfinite(error) || error > 1e-6) {
+                throw std::runtime_error("concurrent execution wave changed logits");
+            }
+        }
+    }
+
+    {
+        auto batch = llama_batch_init(5, 0, 1);
+        const int order[] = {2, 0, 1, 2, 0};
+        const int output_rows[] = {4, 2, 3};
+        std::vector<std::vector<float>> expected(3);
+        for (int row = 0; row < 5; ++row) {
+            const int seq = order[row];
+            const int pos = positions[seq]++;
+            const auto token = tokens[(pos + seq * 13) % tokens.size()];
+            common_batch_add(batch, token, pos, {seq}, row == output_rows[seq]);
+            expected[seq] = step(refs[seq].get(), 0, pos, token);
+        }
+        const std::vector<llama_context *> lanes{independent[0], independent[1], independent[2]};
+        const int status = owner->decode_with_execution_lanes(batch, lanes);
+        llama_batch_free(batch);
+        if (status || owner->get_last_execution_wave_lanes() != 3) {
+            throw std::runtime_error("server execution lane output collection failed");
+        }
+        for (int seq = 0; seq < 3; ++seq) {
+            const auto * logits = llama_get_logits_ith(owner.get(), output_rows[seq]);
+            if (!logits) throw std::runtime_error("collected lane logits missing");
+            const double error = nmse(std::vector<float>(logits, logits + expected[seq].size()), expected[seq]);
+            if (!std::isfinite(error) || error > 1e-6) {
+                throw std::runtime_error("collected lane output mapped to wrong request");
+            }
+        }
+    }
+    {
+        // Hold a real CPU prefill graph in its backend callback until four
+        // independent decode completions occur. A join-all implementation times
+        // out rather than satisfying this ordering assertion.
+        struct delay_state {
+            std::atomic<int> decodes{0};
+            std::atomic<bool> entered{false};
+            std::atomic<bool> overlapped{false};
+        } delay;
+        llama_set_abort_callback(independent[1], [](void * opaque) {
+            auto & state = *static_cast<delay_state *>(opaque);
+            if (!state.entered.exchange(true)) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (state.decodes.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                state.overlapped = state.decodes.load() >= 4;
+            }
+            return false;
+        }, &delay);
+        std::vector<std::pair<llama_context *, llama_batch>> work;
+        const int starts[] = {positions[0], positions[1]};
+        for (int seq = 0; seq < 2; ++seq) {
+            const int count = seq ? 64 : 3;
+            auto batch = llama_batch_init(count, 0, 1);
+            for (int j = 0; j < count; ++j) {
+                const int pos = positions[seq]++;
+                common_batch_add(batch, tokens[(pos + seq * 13) % tokens.size()], pos, {seq}, j == count - 1);
+            }
+            work.emplace_back(independent[seq], batch);
+        }
+        std::vector<std::vector<float>> observed;
+        const size_t vocab_size = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        auto results = owner->decode_execution_wave(work, [&](llama_context * lane, llama_batch & batch) {
+            if (batch.seq_id[0][0] != 0) return false;
+            const auto * logits = llama_get_logits_ith(lane, batch.n_tokens - 1);
+            observed.emplace_back(logits, logits + vocab_size);
+            ++delay.decodes;
+            if (observed.size() == 8) return false;
+            const int pos = positions[0]++;
+            batch.n_tokens = 1;
+            batch.logits[0] = true;
+            batch.pos[0] = pos;
+            batch.token[0] = tokens[pos % tokens.size()];
+            return true;
+        });
+        llama_set_abort_callback(independent[1], nullptr, nullptr);
+        for (auto & item : work) llama_batch_free(item.second);
+        if (!delay.entered || !delay.overlapped || delay.decodes != 8 ||
+                results[0] || results[1]) {
+            throw std::runtime_error("decoder did not continue while prefill remained in flight");
+        }
+        for (int seq = 0; seq < 2; ++seq) {
+            for (int pos = starts[seq]; pos < positions[seq]; ++pos) {
+                auto expected = step(refs[seq].get(), 0, pos, tokens[(pos + seq * 13) % tokens.size()]);
+                if (seq == 0 && pos >= starts[seq] + 2) {
+                    const double error = nmse(observed.at(pos - starts[seq] - 2), expected);
+                    if (!std::isfinite(error) || error > 1e-6) {
+                        throw std::runtime_error("independent continuation changed decode logits");
+                    }
+                } else if (seq == 1 && pos + 1 == positions[seq]) {
+                    const auto * logits = llama_get_logits_ith(independent[seq], -1);
+                    const double error = nmse(std::vector<float>(logits, logits + expected.size()), expected);
+                    if (!std::isfinite(error) || error > 1e-6) {
+                        throw std::runtime_error("independent continuation changed prefill logits");
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "independent continuation: prompt-to-decode and 8 exact outputs, >=4 before other prefill completed\n");
+    }
+    if (!owned_pool_checks) throw std::runtime_error("execution lane ownership gate did not exercise pooled indexer");
+    bool rejected = false;
+    try { auto invalid = owner->create_execution_lane(0); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    if (!rejected) throw std::runtime_error("zero-capacity execution lane was accepted");
+    {
+        auto batch = llama_batch_init(1, 0, 1);
+        common_batch_add(batch, tokens[0], positions[0], {0}, true);
+        std::vector<llama_context *> assigned{lane0.get(), lane1.get(), lane2.get()};
+        const int result = owner->decode_with_execution_lanes(batch, assigned);
+        llama_batch_free(batch);
+        if (result || owner->get_last_execution_wave_lanes() != 1 ||
+                !owner->get_execution_fallback().empty()) {
+            throw std::runtime_error("single sequence bypassed its assigned worker");
+        }
+        auto expected = step(refs[0].get(), 0, positions[0]++, tokens[0]);
+        const auto * logits = llama_get_logits_ith(owner.get(), 0);
+        const double error = nmse(std::vector<float>(logits, logits + expected.size()), expected);
+        if (!std::isfinite(error) || error > 1e-6) {
+            throw std::runtime_error("single worker changed logits");
+        }
+    }
+    {
+        auto batch = llama_batch_init(19, 0, 1);
+        std::vector<std::vector<float>> expected;
+        for (int row = 0; row < 19; ++row) {
+            const int pos = positions[1]++;
+            const auto token = tokens[(pos + 13) % tokens.size()];
+            common_batch_add(batch, token, pos, {1}, true);
+            expected.push_back(step(refs[1].get(), 0, pos, token));
+        }
+        std::vector<llama_context *> assigned{lane0.get(), lane1.get(), lane2.get()};
+        const int result = owner->decode_with_execution_lanes(batch, assigned);
+        llama_batch_free(batch);
+        if (result) throw std::runtime_error("chunked output collection failed");
+        for (int row = 0; row < 19; ++row) {
+            const auto * logits = llama_get_logits_ith(owner.get(), row);
+            const double error = nmse(std::vector<float>(logits, logits + expected[row].size()), expected[row]);
+            if (!std::isfinite(error) || error > 1e-6) {
+                throw std::runtime_error("chunked output row changed logits");
+            }
+        }
+    }
+    owner.reset();
+    for (int seq = 1; seq < 3; ++seq) {
+        auto actual = step(seq == 1 ? lane1.get() : lane2.get(), seq, positions[seq], tokens[0]);
+        auto expected = step(refs[seq].get(), 0, positions[seq], tokens[0]);
+        const double error = nmse(actual, expected);
+        if (!std::isfinite(error) || error > 1e-6) {
+            throw std::runtime_error("execution lane lost shared memory after owner destruction");
+        }
+    }
+}
+
+static void test_glm5next_shared_prefix(llama_model * model, const std::vector<llama_token> & tokens) {
+    scoped_env_var chunks("LLAMA_GLM5NEXT_SPARSE_QUERY_CHUNK", "0");
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto make_context = [&](uint32_t sequences) {
+        auto params = llama_context_default_params();
+        params.n_ctx = 512;
+        params.n_batch = 64;
+        params.n_ubatch = 64;
+        params.n_threads = 2;
+        params.n_threads_batch = 2;
+        params.n_seq_max = sequences;
+        params.kv_unified = true;
+        params.type_k = GGML_TYPE_F16;
+        params.type_v = GGML_TYPE_F16;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        if (!ctx) { throw std::runtime_error("shared-prefix context allocation failed"); }
+        return ctx;
+    };
+    auto step = [&](llama_context * ctx, int position, int sequences) {
+        llama_batch batch = llama_batch_init(sequences, 0, 1);
+        for (int s = 0; s < sequences; ++s) {
+            common_batch_add(batch, tokens[position % tokens.size()], position, { s }, true);
+        }
+        const int result = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (result) { throw std::runtime_error("shared-prefix decode failed"); }
+    };
+    for (const int prefix : { 64, 200 }) {
+        auto shared = make_context(3);
+        auto reference = make_context(1);
+        for (int p = 0; p < prefix; ++p) {
+            step(shared.get(), p, 1);
+            step(reference.get(), p, 1);
+        }
+        llama_memory_seq_cp(llama_get_memory(shared.get()), 0, 1, -1, -1);
+        llama_memory_seq_cp(llama_get_memory(shared.get()), 0, 2, -1, -1);
+        step(shared.get(), prefix, 3);
+        step(reference.get(), prefix, 1);
+        const float * ref = llama_get_logits_ith(reference.get(), 0);
+        const std::vector<float> expected(ref, ref + n_vocab);
+        for (int s = 0; s < 3; ++s) {
+            const float * actual = llama_get_logits_ith(shared.get(), s);
+            const double error = nmse(std::vector<float>(actual, actual + n_vocab), expected);
+            if (!std::isfinite(error) || error > 1e-6) {
+                throw std::runtime_error("shared-prefix indexer changed sequence logits");
+            }
+        }
     }
 }
 
@@ -1725,12 +2301,18 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         model_and_ctx_cpu = get_model_and_ctx(
                                 gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode, arch == LLM_ARCH_GLM5NEXT);
                         if (arch == LLM_ARCH_GLM5NEXT) {
+                            test_glm5next_recurrent_no_alloc(model_and_ctx_cpu.first.get());
                             test_glm5next_fa_cache_types(model_and_ctx_cpu.first.get());
                             test_glm5next_native_f16_chunk_graph(model_and_ctx_cpu.first.get(), tokens);
+                            test_glm5next_native_f16_chunk_graph(model_and_ctx_cpu.first.get(), tokens, 3);
                             test_glm5next_native_f16_state(model_and_ctx_cpu.first.get(), tokens);
                             test_glm5next_mtp_driver(model_and_ctx_cpu.first.get(), tokens);
                             test_glm5next_turbo3_cpu_guard(model_and_ctx_cpu.first.get());
                             test_glm5next_failed_state_restore_cleanup(model_and_ctx_cpu.first.get(), tokens);
+                            test_glm5next_shared_prefix(model_and_ctx_cpu.first.get(), tokens);
+                            test_glm5next_execution_lane_storage(model_and_ctx_cpu.first.get(), tokens);
+                            test_glm5next_logical_attention_span(model_and_ctx_cpu.first.get(), tokens);
+                            test_glm5next_restored_prefix_sharing(model_and_ctx_cpu.first.get(), tokens);
                             test_glm5next_paged_state_restore(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens);
                         }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);

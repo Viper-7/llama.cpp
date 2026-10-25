@@ -420,8 +420,8 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             kbuf->nb[2], kbuf->nb[3], 0);
 
     // pool only what this ubatch closed. the count is fixed (see build_inp_kpool), so the
-    // decode graph keeps one shape; unused slots repeat a complete pool, whose recompute is
-    // idempotent. non-resident slots hold 0, not a sentinel; garbage pools die to pool_bias.
+    // decode graph keeps one shape; unused slots repeat a newly written pool or
+    // the current private tail. Shared-prefix pooled heads remain immutable.
     const int64_t n_new_max = inp_kp->new_pool_cells->ne[0]/r;
 
     ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, inp_kp->new_pool_cells);

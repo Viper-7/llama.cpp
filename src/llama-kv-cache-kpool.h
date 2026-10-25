@@ -95,6 +95,9 @@ public:
     // tokens and defeat graph reuse / force CUDA-graph recapture.
     uint32_t n_new_max = 0;
 
+    // Attention topology uses the private sequence range, not shared occupancy.
+    uint32_t attention_span = 0;
+
     // this graph was built to re-emit every pool after a position mutation, not just the
     // ones this ubatch closed. decided at build time because it sets n_new_max above.
     bool rebuild = false;

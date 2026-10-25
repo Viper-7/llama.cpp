@@ -428,6 +428,10 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // Logical range of a single-sequence batch, independent of unrelated cells.
+    // Reserve and multi-sequence contexts retain the physical bound.
+    uint32_t get_n_kv_logical() const;
+
     // the stream RANGE s1 - s0 + 1 that get_k/get_v use as `ns`, not n_seqs_unq
     uint32_t get_n_stream() const;
 
@@ -510,4 +514,5 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    uint32_t n_kv_logical = 0;
 };

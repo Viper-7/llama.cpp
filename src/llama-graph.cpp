@@ -1415,6 +1415,7 @@ void llm_graph_result::reset() {
     t_candidates.clear();
     t_hidden_states.clear();
     t_moe_routes.clear();
+    t_moe_route_weights.clear();
 
     params = {};
 
@@ -1497,6 +1498,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
+    }
+    for (auto & entry : t_moe_route_weights) {
+        ggml_set_output(entry.second);
     }
 }
 
@@ -2403,6 +2407,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (arch == LLM_ARCH_GLM5NEXT && cparams.moe_route_stats && !cparams.warmup && il >= 0) {
+        res->t_moe_route_weights[il] = weights;
     }
 
     //call early so that topk-moe can be used
@@ -4140,7 +4148,8 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         GGML_ASSERT(n_ps >= 1 && (int64_t) ubatch.n_seqs_unq == n_ps*n_stream);
 
-        const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
+        inp->attention_span = cparams.independent_execution ? mctx_attn->get_n_kv_logical() : n_kv;
+        const int64_t n_pools = llama_kpool_n_pools(inp->attention_span, kpool, n_ps);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
 
@@ -4320,10 +4329,11 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     // valid. Keep the one cache write above, then build independent compact
     // attention windows inside this graph and project their joined output once.
     // This route bounds the gathered scratch below the cache size for Turbo3 and native F16.
-    const int64_t max_chunk_tps = k->ne[2] > n_padded ? (k->ne[2] - 1)/n_padded : 0;
+    const int64_t attention_span = cparams.independent_execution ? inp->mctx->get_n_kv_logical() : k->ne[2];
+    const int64_t max_chunk_tps = attention_span > n_padded ? (attention_span - 1)/n_padded : 0;
     const bool chunked_cache_type = turbo3_rotated_basis || k->type == GGML_TYPE_F16;
     if (compact_enabled && chunked_cache_type && use_segmented && cparams.glm5next_sparse_query_chunk > 0 &&
-            n_stream == 1 && n_window >= k->ne[2] &&
+            n_stream == 1 && n_window >= attention_span &&
             max_chunk_tps >= cparams.glm5next_sparse_query_chunk) {
         GGML_ASSERT(q->ne[2] == n_tps && q->ne[3] == 1);
 
@@ -4399,7 +4409,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         return apply_output_proj(joined);
     }
 
-    if (compact_enabled && n_window < k->ne[2]) {
+    if (cparams.independent_execution || (compact_enabled && n_window < k->ne[2])) {
         ggml_tensor * compact_idx = ggml_concat(ctx0, top_k, tail_pad_cells, 0);
         compact_idx = ggml_reshape_2d(ctx0, compact_idx, n_window, n_stream);
         cb(compact_idx, "kpool_compact_idx", il);
@@ -4422,7 +4432,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
                 k->nb[1], k->nb[2], k->nb[3], 0);
         cb(k, "kpool_compact_k", il);
 
-        // Invalid/nonresident pools use row 0 as a gather placeholder. Repeating the
+        // Invalid/nonresident pools use an owned row as a gather placeholder. Repeating the
         // selected pool bias over its members keeps every such placeholder at -infinity.
         ggml_tensor * pool_bias_rows = ggml_view_4d(ctx0, pool_bias,
                 1, pool_bias->ne[0], n_tps, n_stream,

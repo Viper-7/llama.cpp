@@ -15,6 +15,9 @@
 
 #include <array>
 #include <map>
+#include <array>
+#include <atomic>
+#include <functional>
 #include <deque>
 #include <string>
 #include <vector>
@@ -49,7 +52,48 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+                  std::shared_ptr<llama_memory_i> shared_memory = {});
+
+    // Private compute graph, outputs and backend streams over the same KV pool.
+    // Memory planning/mutation remains coordinator-owned; this is not a
+    // thread-safe llama_decode API until the execution-wave contract is applied.
+    std::unique_ptr<llama_context> create_execution_lane(uint32_t batch_capacity, uint32_t logical_capacity = 0);
+
+    // Caller fences cache mutation and owns each context until all results return.
+    // Completion runs on the coordinator after the lane has synchronized.
+    // It holds shared-memory planning and may continue the private tail with
+    // one token without joining other lanes. wait_idle quiesces metadata readers.
+    using execution_completion = std::function<bool(llama_context *, llama_batch &)>;
+    using execution_wait = std::function<void(const std::function<void()> &)>;
+    std::vector<int> decode_execution_wave(const std::vector<std::pair<llama_context *, llama_batch>> & work,
+            execution_completion completed = {}, execution_wait wait_idle = {});
+
+    int decode_with_execution_lanes(const llama_batch & batch, const std::vector<llama_context *> & lanes,
+        const std::vector<std::pair<llama_context *, llama_batch>> & additional = {},
+            execution_completion completed = {}, execution_wait wait_idle = {});
+    const std::string & get_execution_fallback() const { return execution_fallback; }
+
+    // Cumulative worker wall times; relaxed snapshots may straddle a completion.
+    // No GPU operations or shared-memory inspection are performed by readers.
+    std::array<uint64_t, 8 + GGML_SCHED_TRANSPORT_PROFILE_FIELDS> get_execution_profile() const {
+        std::array<uint64_t, 8 + GGML_SCHED_TRANSPORT_PROFILE_FIELDS> result{};
+        for (size_t i = 0; i < result.size(); ++i) result[i] = execution_profile[i].load(std::memory_order_relaxed);
+        return result;
+    }
+
+    std::vector<std::string> get_execution_backend_names() const {
+        std::vector<std::string> names;
+        for (auto * backend : backend_ptrs) names.emplace_back(ggml_backend_name(backend));
+        return names;
+    }
+
+    std::pair<const char *, size_t> get_route_capture_memory() const {
+        return buf_moe_routes ? std::make_pair(ggml_backend_buffer_name(buf_moe_routes.get()),
+            ggml_backend_buffer_get_size(buf_moe_routes.get())) : std::make_pair("none", size_t(0));
+    }
+
+    size_t get_last_execution_wave_lanes() const { return last_execution_wave_lanes; }
 
     ~llama_context();
 
@@ -67,6 +111,9 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    void set_execution_input_validator(std::function<void(const llm_graph_result &)> validator) {
+        execution_input_validator = std::move(validator);
+    }
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -335,7 +382,18 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
-    llama_memory_ptr memory;
+    std::function<void(const llm_graph_result &)> execution_input_validator;
+    std::function<void()> execution_dispatch_begin;
+    std::function<void()> execution_dispatch_end;
+    // calls, planning wait/held, graph submission, outputs, final sync,
+    // input population, graph preparation. The last two overlap planning held.
+    std::array<std::atomic<uint64_t>, 8 + GGML_SCHED_TRANSPORT_PROFILE_FIELDS> execution_profile{};
+    bool execution_wave_active = false;
+    size_t last_execution_wave_lanes = 0;
+    uint64_t execution_lane_id = 0;
+    std::string execution_fallback;
+    const llama_context_params params_init;
+    std::shared_ptr<llama_memory_i> memory;
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
@@ -413,11 +471,15 @@ private:
         int32_t layer = -1;
         size_t n_used = 0;
         size_t n_tokens = 0;
-        std::vector<int32_t> ids;
+        buffer_view<int32_t> ids = {nullptr, 0};
+        buffer_view<float> weights = {nullptr, 0};
     };
+    static constexpr size_t MOE_ROUTE_PENDING_LIMIT = 16u * 1024u * 1024u;
+    ggml_backend_buffer_ptr buf_moe_routes;
     std::deque<moe_route_snapshot> moe_route_pending;
     size_t moe_route_pending_bytes = 0;
     uint64_t moe_route_next_report = 4096;
+    int64_t moe_route_next_snapshot_us = 0;
     llama_moe_route_stats moe_route_stats;
 
     struct sampling_info {

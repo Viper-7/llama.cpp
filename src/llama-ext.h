@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <vector>
+#include <utility>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -206,3 +207,17 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+// Caller proves equal prefix tokens/media and adapters. Share attention/indexer
+// cells only; preserve destination recurrent state restored at its own endpoint.
+LLAMA_API bool llama_glm5next_share_prefix(llama_context * ctx, llama_seq_id source,
+                                        llama_seq_id destination, llama_pos end);
+// Seed an empty sequence with immutable attention/indexer rows only. The caller
+// must import an exact recurrent checkpoint before decoding the destination.
+LLAMA_API bool llama_glm5next_seed_prefix(llama_context * ctx, llama_seq_id source,
+                                         llama_seq_id destination, llama_pos end);
+
+
+// Conservative physical occupancy bound for the listed live sequences. Each
+// budget is its maximum logical position count; unlisted idle sequences may be evicted.
+LLAMA_API uint64_t llama_glm5next_reserved_cells(llama_context * ctx,
+        const std::vector<std::pair<llama_seq_id, uint32_t>> & budgets);

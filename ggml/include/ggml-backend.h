@@ -310,6 +310,18 @@ extern "C" {
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    // Numeric transport accounting, read only on the scheduler's owning thread.
+    // Values: dispatches, copies, bytes, copy submit, dependency submit,
+    // blocking wait, synchronous copy, compute submit (times in microseconds).
+    // Then per-backend source-readiness wait microseconds and call counts.
+    #define GGML_SCHED_TRANSPORT_PROFILE_BACKENDS 16
+    #define GGML_SCHED_TRANSPORT_PROFILE_FIELDS (8 + 2*GGML_SCHED_TRANSPORT_PROFILE_BACKENDS)
+    struct ggml_backend_sched_transport_profile {
+        uint64_t values[GGML_SCHED_TRANSPORT_PROFILE_FIELDS];
+    };
+    GGML_API void ggml_backend_sched_enable_transport_profile(ggml_backend_sched_t sched);
+    GGML_API struct ggml_backend_sched_transport_profile ggml_backend_sched_get_transport_profile(ggml_backend_sched_t sched);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
@@ -365,6 +377,12 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+
+    // Opt in before graph allocation, with parallel=false. Exactly one graph may
+    // be in flight. All graph inputs must remain alive and immutable until
+    // sched_synchronize (also before reset/free). Unsupported backends fall back
+    // to synchronous copies. The default preserves immediate input-copy semantics.
+    GGML_API void ggml_backend_sched_set_owned_inputs(ggml_backend_sched_t sched, bool owned);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

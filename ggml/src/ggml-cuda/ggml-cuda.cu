@@ -6510,8 +6510,67 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#ifndef GGML_USE_MUSA
+static void ggml_backend_cuda_set_compute_priority(ggml_backend_t backend, bool high) {
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ctx->stream_priority_high == high) return;
+    ggml_cuda_set_device(ctx->device);
+    int least = 0, greatest = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    const int priority = high ? greatest : std::clamp(0, greatest, least);
+    ctx->stream_priority_high = high;
+    if (ctx->stream_priority == priority) return;
+
+    // Only an owned, idle worker may change mode. Settle its input transfers
+    // before replacing streams; other contexts and GPUs remain independent.
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (ctx->streams[device][stream] != nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaStreamSynchronize(ctx->streams[device][stream]));
+            }
+        }
+    }
+#ifdef USE_CUDA_GRAPH
+    ctx->cuda_graphs.clear();
+#endif
+    ctx->concurrent_stream_context.reset();
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (ctx->streams[device][stream] != nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaStreamDestroy(ctx->streams[device][stream]));
+                ctx->streams[device][stream] = nullptr;
+            }
+        }
+    }
+    ctx->stream_priority = priority;
+    // Cached BLAS handles retain their original stream until explicitly rebound.
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (ctx->cublas_handles[device][stream] != nullptr) {
+                ggml_cuda_set_device(device);
+                CUBLAS_CHECK(cublasSetStream(ctx->cublas_handles[device][stream], ctx->stream(device, stream)));
+#if !defined(GGML_USE_HIP) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+                if (ctx->cublas_workspaces[device][stream] != nullptr) {
+                    CUBLAS_CHECK(cublasSetWorkspace(ctx->cublas_handles[device][stream],
+                            ctx->cublas_workspaces[device][stream], ctx->cublas_workspace_sizes[device]));
+                }
+#endif
+            }
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifndef GGML_USE_MUSA
+    if (strcmp(name, "ggml_backend_set_compute_priority") == 0) {
+        return (void *)ggml_backend_cuda_set_compute_priority;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

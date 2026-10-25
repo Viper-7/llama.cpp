@@ -76,6 +76,7 @@ enum server_control_action {
 };
 
 struct task_params {
+    int execution_priority = 2; // canonical host execution rank, independent of cache retention
     std::string serverless_request_id; // immutable owner-bound native attempt identity
     bool stream          = false;
     bool include_usage   = false;
@@ -170,6 +171,8 @@ struct task_result_state {
 
 struct server_task {
     int id = -1; // to be filled by server_queue
+    int prefix_producer = -1;
+    int64_t prefix_progress_ms = 0;
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
@@ -366,6 +369,11 @@ struct server_task {
 };
 
 struct result_prompt_progress {
+    bool waiting_for_prefill_workspace = false;
+    bool waiting_for_prefix = false;
+    std::string prefix_producer;
+    int32_t prefix_target_tokens = 0;
+    int32_t prefix_published_tokens = 0;
     int32_t total = 0;
     int32_t cache = 0;
     int32_t processed = 0;

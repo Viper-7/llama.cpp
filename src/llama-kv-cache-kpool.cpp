@@ -15,7 +15,10 @@ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs) {
     GGML_ASSERT(kpool > 0);
     GGML_ASSERT(n_seqs > 0);
 
-    return n_kv/kpool + 2*n_seqs;
+    // Shared physical cells can belong to a full logical pool run in every sequence.
+    const uint64_t count = (uint64_t(n_kv)/kpool + 2)*n_seqs;
+    GGML_ASSERT(count <= std::numeric_limits<uint32_t>::max());
+    return uint32_t(count);
 }
 
 uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t kpool) {
@@ -242,10 +245,24 @@ void llama_kv_cache_set_input_kpool(
         float   * cur_tail_valid = has_compact_inputs ? dst_tail_valid + s*(n_tps*n_suffix) : nullptr;
         int32_t * cur_seg_rows   = has_segment_rows   ? dst_seg_rows   + s*(n_tps*n_padded) : nullptr;
 
-        std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
+        // Padding must reference this batch's own state. Row zero may belong
+        // to another execution lane, and an old complete pool may be shared.
+        const auto fallback_seq = ubatch->seq_id[s*n_tps][0];
+        const auto & fallback_cells = kv->get_cells(fallback_seq);
+        int32_t fallback = -1;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (!fallback_cells.is_empty(j) && fallback_cells.seq_has(j, fallback_seq) &&
+                    fallback_cells.pos_get(j) == ubatch->pos[s*n_tps]) {
+                fallback = (int32_t) j;
+                break;
+            }
+        }
+        GGML_ASSERT(fallback >= 0);
+
+        std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, fallback);
         std::fill(cur_pool_bias,  cur_pool_bias  + n_tps*n_pools, -INFINITY);
         if (has_compact_inputs) {
-            std::fill(cur_tail_cells, cur_tail_cells + n_tps*n_suffix, 0);
+            std::fill(cur_tail_cells, cur_tail_cells + n_tps*n_suffix, fallback);
             std::fill(cur_tail_valid, cur_tail_valid + n_tps*n_suffix, -INFINITY);
         }
         if (has_segment_rows) {
@@ -263,16 +280,9 @@ void llama_kv_cache_set_input_kpool(
         // count of real entries emitted for this stream; the rest is padding
         int64_t n_new = 0;
 
-        // members of any complete pool in this stream, used to pad the fixed-size write.
-        // recomputing a complete pool is idempotent, so a repeat is always safe.
-        const int32_t * any_rep_src = nullptr;
-
         if (kcache) {
-            // a pool with no rep gathers row 0. that row's pooled third may hold another
-            // pool's key, but such a pool is always -INFINITY in pool_bias, so the value is
-            // discarded before it can score.
-            std::fill(cur_pool_reps, cur_pool_reps + n_pools, 0);
-            std::fill(cur_new_cells, cur_new_cells + r*n_new_max, 0);
+            std::fill(cur_pool_reps, cur_pool_reps + n_pools, fallback);
+            std::fill(cur_new_cells, cur_new_cells + r*n_new_max, fallback);
         }
 
         // the token loop writes rows < n_tps in full; only the padding rows need clearing
@@ -412,9 +422,6 @@ void llama_kv_cache_set_input_kpool(
                     if (filled[p] == (int32_t) r) {
                         cur_pool_reps[run_off[ps] + p] = part_pool_cells[p*r + (r - 1)];
 
-                        if (any_rep_src == nullptr) {
-                            any_rep_src = part_pool_cells + p*r;
-                        }
                     }
                 }
 
@@ -536,20 +543,15 @@ void llama_kv_cache_set_input_kpool(
         GGML_ASSERT(n_done == n_tps && "every query must belong to a sequence of the ubatch");
 
         if (kcache) {
-            // the write has a fixed row count, so the unused slots must name a destination
-            // that is safe to overwrite. two cases, both provably harmless:
-            //   - some complete pool exists: repeat it. recomputing a complete pool yields
-            //     the value already there, so the duplicate write is a no-op in effect.
-            //   - none exists: no cell in this stream is the last member of a complete pool,
-            //     so no pooled third is read (every pool is -INFINITY in pool_bias). cell 0
-            //     is then free.
+            // Repeat a pool actually written by this batch, never an immutable
+            // shared-prefix pool. With no completed pool, the current token's
+            // unused pooled head is private scratch and cannot affect selection.
             for (int64_t p = n_new; p < n_new_max; ++p) {
-                if (any_rep_src) {
-                    std::copy(any_rep_src, any_rep_src + r, cur_new_cells + p*r);
-                    cur_new_reps[p] = (int64_t) strm_of[s]*kv_size + any_rep_src[r - 1];
+                if (n_new > 0) {
+                    std::copy(cur_new_cells, cur_new_cells + r, cur_new_cells + p*r);
+                    cur_new_reps[p] = cur_new_reps[0];
                 } else {
-                    // cells already 0 from the fill; pool r copies of cell 0 into cell 0
-                    cur_new_reps[p] = (int64_t) strm_of[s]*kv_size;
+                    cur_new_reps[p] = (int64_t) strm_of[s]*kv_size + fallback;
                 }
             }
         }
@@ -619,7 +621,9 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
         const int64_t n_tps    = params.ubatch.n_tokens/n_stream;
         const int64_t n_ps     = params.ubatch.n_seqs_unq/n_stream;
         const int64_t n_kv     = attn->get_n_kv();
-        const int64_t n_pools  = llama_kpool_n_pools(n_kv, kpool, n_ps);
+        const int64_t span_cur = params.cparams.independent_execution ? attn->get_n_kv_logical() : n_kv;
+        const int64_t n_pools  = llama_kpool_n_pools(span_cur, kpool, n_ps);
+        res &= attention_span == span_cur;
         const int64_t n_select = kpool*llama_kpool_select_k(n_pools, params.hparams.indexer_top_k, kpool);
         const int64_t n_padded = GGML_PAD(n_select + kpool - 1, 256);
         const int64_t n_suffix = n_padded - n_select;

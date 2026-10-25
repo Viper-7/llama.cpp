@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
 #include <vector>
 
 class llama_moe_route_stats {
@@ -14,6 +15,12 @@ public:
         uint64_t routed_tokens = 0;
         uint64_t invalid_ids   = 0;
         std::vector<uint64_t> expert_hits;
+        std::vector<uint64_t> q1_hits;
+        std::vector<uint64_t> multi_hits;
+        std::vector<double> weight_sums;
+        uint64_t q1_rows = 0;
+        uint64_t multi_rows = 0;
+        uint64_t invalid_weights = 0;
         std::vector<uint64_t> coactivations;
         // q2--q6 raw aggregates: calls / distinct experts / repeated hits /
         // repeated hits retaining their most-common rank slot.
@@ -24,7 +31,8 @@ public:
     };
 
     bool configure(uint32_t n_layers, uint32_t n_experts);
-    bool add(int32_t layer, const int32_t * ids, size_t n_used, size_t n_tokens);
+    bool add(int32_t layer, const int32_t * ids, size_t n_used, size_t n_tokens, const float * weights = nullptr);
+    std::string snapshot_json(const char * context) const;
 
     void note_dropped(uint64_t route_rows);
 

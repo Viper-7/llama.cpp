@@ -1,11 +1,16 @@
-# llama.cpp: tiered prompt checkpoints and gfx906 tuning
+# llama.cpp: concurrent GLM inference, tiered checkpoints and gfx906 tuning
 
 An independent fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) for running large models on older AMD GPUs, retaining useful prompt state across requests and model unloads, and making cache behavior observable. Take the ideas, adapt the code, or use the fork directly under the existing [MIT license](LICENSE).
 
 The additions were developed around GLM-5.3-Flash on six Radeon Instinct MI50 cards. This is a research and deployment fork, not a proposal that upstream adopt the entire patch set. Upstream attribution and license notices are retained. AI coding assistance was used in developing and integrating this fork.
 
+See [concurrent execution](docs/CONCURRENT_GLM_INFERENCE.md) for design, configuration, tests and limitations.
+
 ## What is different
 
+- **Independent execution lanes.** Six GLM workers share weights and KV storage while owning separate execution state. Two substantial prefills can overlap with decode; idle prefill workers can decode too.
+- **Shared-prefix dependencies.** Followers can wait for an active producer to publish matching pages. Capacity checks include idle resident heads and preserve valid checkpoints under active pressure.
+- **Expert instrumentation.** Bounded per-worker router counts and weights support workload analysis without recording prompt text.
 - **Range checkpoints, not just whole prompts.** Shared prefix nodes and branch tails retain target attention, indexer and recurrent state, with exact token/media boundaries and optional draft state.
 - **Persistent RAM plus asynchronous SSD backing.** Linux tmpfs mappings survive the server process. A bounded background writer backs immutable payloads on disk; recovery verifies descriptors and loads cold payloads when needed.
 - **Explicit cache lifecycle.** Requests can identify a branch, distinguish interactive/background work, and choose retained, ephemeral or one-shot behavior. Age, bounded reuse frequency and recomputation cost influence eviction; shared ancestors and active leases remain protected.
@@ -16,19 +21,20 @@ The cache is implemented in `llama-server`. TGWUI is an optional frontend; a cli
 
 ## Reference configuration
 
-This is the configured deployment profile inspected on 2026-10-21, not a claim that every setting is optimal elsewhere. The modernized source must be validated separately from the older deployment build. Hardware: two Xeon E5-2697A v4 CPUs (32 physical cores / 64 threads total), approximately 128 GiB system RAM, six 32 GiB MI50/gfx906 GPUs across two NUMA nodes, and local SSD storage. The established toolchain is ROCm 6.3.3.
+This is the configured deployment profile qualified through 2026-10-24, not a claim that every setting is optimal elsewhere. The integrated public source is tested separately from the production build; historical GPU measurements are not a performance guarantee for this port or other hardware. Hardware: two Xeon E5-2697A v4 CPUs (32 physical cores / 64 threads total), approximately 128 GiB system RAM, six 32 GiB MI50/gfx906 GPUs across two NUMA nodes, and local SSD storage. The established toolchain is ROCm 6.3.3.
 
 | Setting | Reference value |
 |---|---|
 | Model | GLM-5.3-Flash UD-IQ4_XS, five local GGUF shards |
 | Projector | GLM-5.3-Flash F16 |
-| Context / simultaneous slots | 204800 tokens / 1 |
+| Context / simultaneous slots | 266240 shared physical positions / 6; 204800 per-request cap |
 | GPU layers | 47 |
 | CPU threads / batch threads | 48 / 48 |
-| Batch / microbatch | 4096 / 2048 |
+| Logical batch / coordinator microbatch | 8192 / 16 |
+| Worker microbatches | 512, 512, 1, 1, 1, 1 |
 | KV cache / flash attention | F16 / enabled |
-| Tensor split | `1.2,0.85,0.9,1.05,0.65,1.35` |
-| Explicit placement | Layer 45 and token embeddings on `ROCm4`; projector on `ROCm2` |
+| Tensor split | `1.2,0.85,0.9,1.05,0.8,1.2` |
+| Explicit placement | Layer 45, token embeddings and layer 31 down experts on `ROCm4`; projector on `ROCm2` |
 | Speculative decoding | Disabled (`--spec-type none`) |
 | Memory mapping / NUMA | `--no-mmap` / `--numa distribute` |
 | Automatic fitting | Disabled |
@@ -69,8 +75,17 @@ LLAMA_PAGE_RAM_TEST_LIB_DIR="$PWD/build-cpu/bin" \
 These are the reference profile's environment overrides:
 
 ```sh
+export LLAMA_GLM5NEXT_EXECUTION_LANES=6
+export LLAMA_GLM5NEXT_PREFILL_WORKERS=2
+export LLAMA_GLM5NEXT_WORKER_BATCHES=512,512,1,1,1,1
+export LLAMA_GLM5NEXT_PREFILL_BATCH=512
+export GGML_CUDA_DISABLE_GRAPHS=1
+export GPU_MAX_HW_QUEUES=32
+export GGML_SCHED_READY_COPY_MIN_BYTES=1
+export LLAMA_EXECUTION_READY_READBACK=1
+export LLAMA_EXECUTION_GPU_PRIORITY=1
 export GGML_HIP_NO_PEER_STAGING=1
-export GGML_HIP_NO_PEER_STAGING_MAX_BYTES=1048576
+export GGML_HIP_NO_PEER_STAGING_MAX_BYTES=33554432
 export GGML_HIP_NO_PEER_STAGING_TIMING=0
 export GGML_SCHED_ALIAS_COPIES=1
 export GGML_SCHED_ALIAS_SUBVIEWS=1
@@ -87,11 +102,12 @@ With local model/projector paths substituted:
 build-hip/bin/llama-server \
   --model /models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf \
   --mmproj /models/mmproj-GLM-5.3-Flash-F16.gguf \
-  --ctx-size 204800 --parallel 1 --n-gpu-layers 47 \
-  --threads 48 --threads-batch 48 --batch-size 4096 --ubatch-size 2048 \
+  --ctx-size 266240 --parallel 6 --kv-unified --kv-unified-per-slot 204800 --n-gpu-layers 47 \
+  --threads 48 --threads-batch 48 --batch-size 8192 --ubatch-size 16 \
   --flash-attn on --cache-type-k f16 --cache-type-v f16 \
-  --tensor-split 1.2,0.85,0.9,1.05,0.65,1.35 \
+  --tensor-split 1.2,0.85,0.9,1.05,0.8,1.2 \
   --override-tensor '(blk\.45\..*|token_embd\.weight)=ROCm4' \
+  --override-tensor 'blk\.31\.ffn_down_exps\.weight=ROCm4' \
   --mmproj-device ROCm2 --spec-type none --fit off \
   --no-mmap --numa distribute \
   --cache-ram 0 --cache-page-ram 98304 --cache-page-tokens 2048
@@ -131,7 +147,7 @@ Priority is `interactive` or `background`; lifecycle is `retained`, `ephemeral` 
 
 ## Reproducing the cache checks
 
-The fork is integrated with upstream commit `8baabd53b77d1c48c6ef8d3b620436292f3f6231`. The CPU storage suite, synthetic GLM target/draft state tests, and HTTP restart tests are independent of the large reference model. The HTTP test checks cold prefill, live reuse, process restart with tmpfs intact, and recovery after deleting its temporary RAM cache while retaining SSD backups. It asserts identical output and restored-token counts.
+The fork retains its upstream integration at `8baabd53b77d1c48c6ef8d3b620436292f3f6231`. Concurrency changes were ported from production source `85ce7b07da2e6d733ea2f39653d6b952a19e65f9` onto that base. The CPU storage suite, synthetic GLM target/draft state tests, and HTTP restart tests are independent of the large reference model. The HTTP test checks cold prefill, live reuse, process restart with tmpfs intact, and recovery after deleting its temporary RAM cache while retaining SSD backups. It asserts identical output and restored-token counts.
 
 ```sh
 cmake -S . -B build-cpu -DGGML_HIP=OFF -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON

@@ -2928,6 +2928,19 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv_logical = n_kv;
+    const auto & ubatch = ubatches[i_cur];
+    if (ubatch.n_seqs_unq == 1) {
+        const auto seq = ubatch.seq_id_unq[0];
+        const auto p0 = kv->seq_pos_min(seq);
+        const auto p1 = kv->seq_pos_max(seq);
+        if (p0 >= 0 && p1 >= p0) {
+            // Position range, not cell count: holes/rebases must retain their pools.
+            // Keep the original physical cap for large sparse position ranges.
+            const uint64_t span = uint64_t(p1) - uint64_t(p0) + 1;
+            n_kv_logical = std::min<uint64_t>(n_kv, GGML_PAD(std::max<uint64_t>(256, span), 256));
+        }
+    }
 
     return true;
 }
@@ -2944,6 +2957,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_logical() const {
+    return n_kv_logical ? n_kv_logical : n_kv;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

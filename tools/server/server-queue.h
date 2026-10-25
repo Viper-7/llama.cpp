@@ -23,6 +23,7 @@ private:
     // queues
     std::deque<server_task> queue_tasks;
     std::deque<server_task> queue_tasks_deferred;
+    std::deque<server_task> queue_tasks_prefix;
     // tasks declined while yielding, put back in queue_tasks once the yield is done
     // note: kept as a member so that cleanup_pending_task() can also reach them
     std::deque<server_task> queue_tasks_unhandled;
@@ -58,6 +59,9 @@ public:
 
     // Add a new task, but defer until one slot is available
     void defer(server_task && task);
+    void defer_prefix(server_task && task);
+    void poll_prefix();
+    int prefix_priority(int producer, int priority);
 
     // Get the next id for creating a new task
     int get_new_id();
@@ -104,10 +108,14 @@ public:
     // tasks declined by callback_new_task are put back in the queue once this returns
     void yield_to_queue(std::function<void()> && work);
 
+    // A compute window must fence before admitting work that mutates slots.
+    // Read-only observers must not force all GPU lanes back into lockstep.
+    bool has_pending_control_tasks();
+
     // for metrics
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
-        return queue_tasks_deferred.size();
+        return queue_tasks_deferred.size() + queue_tasks_prefix.size();
     }
 
     //

@@ -29,6 +29,16 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <fstream>
+#include <future>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <set>
+#include <cstdio>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 //
 // llama_context
@@ -240,10 +250,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              std::shared_ptr<llama_memory_i> shared_memory) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
+    params_init(params),
     // MTP uses the embd input for the hidden state
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
                 llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
@@ -455,6 +467,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.independent_execution = bool(shared_memory);
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -556,8 +569,8 @@ llama_context::llama_context(
             if (segmented_env == nullptr || std::atoi(segmented_env) == 0) {
                 throw std::runtime_error("GLM5Next native F16 query chunks require LLAMA_GLM5NEXT_SPARSE_SEGMENTED=1");
             }
-            if (cparams.n_seq_max != 1) {
-                throw std::runtime_error("GLM5Next native F16 query chunks currently require n_seq_max=1");
+            if (cparams.n_seq_max != 1 && !cparams.kv_unified) {
+                throw std::runtime_error("GLM5Next native F16 query chunks require unified KV for multiple sequences");
             }
             if (hparams.n_lora_kv != 512) {
                 throw std::runtime_error("GLM5Next native F16 query chunks require a 512-wide shared latent");
@@ -646,6 +659,18 @@ llama_context::llama_context(
         }
     }
 
+    // HIP async D2H needs pinned destinations. Allocate once before any graph,
+    // and retain arena views until synchronize() consumes every pending copy.
+    if (!hparams.vocab_only && cparams.moe_route_stats) {
+        auto * dev = model.dev_output();
+        auto * buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (!buft) buft = ggml_backend_cpu_buffer_type();
+        buf_moe_routes.reset(ggml_backend_buft_alloc_buffer(buft, MOE_ROUTE_PENDING_LIMIT));
+        if (!buf_moe_routes) throw std::runtime_error("failed to reserve expert capture host buffer");
+        LLAMA_LOG_INFO("%s: %s expert capture host buffer = %.2f MiB\n", __func__,
+            ggml_backend_buffer_name(buf_moe_routes.get()), double(MOE_ROUTE_PENDING_LIMIT)/(1024*1024));
+    }
+
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
@@ -656,7 +681,11 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        if (shared_memory) {
+            memory = std::move(shared_memory);
+        } else {
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
     }
 
     // init backends
@@ -713,6 +742,7 @@ llama_context::llama_context(
             add_pipeline_reason("tensor_overrides");
         }
         bool pipeline_parallel =
+            !cparams.independent_execution && // one in-flight token/batch per private lane
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
@@ -773,6 +803,26 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+}
+
+std::unique_ptr<llama_context> llama_context::create_execution_lane(uint32_t batch_capacity, uint32_t logical_capacity) {
+    if (!logical_capacity) logical_capacity = batch_capacity;
+    if (model.arch != LLM_ARCH_GLM5NEXT || !cparams.kv_unified ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.ctx_other ||
+            !memory || cparams.n_ctx <= model.hparams.indexer_top_k + model.hparams.indexer_kpool - 1 ||
+            batch_capacity == 0 || batch_capacity > logical_capacity || logical_capacity > cparams.n_batch) {
+        throw std::invalid_argument("execution lanes require a unified GLM target and bounded batch capacity");
+    }
+    synchronize();
+    auto params = params_init;
+    params.n_ctx = cparams.n_ctx;
+    params.n_seq_max = cparams.n_seq_max;
+    params.n_batch = logical_capacity;
+    params.n_ubatch = batch_capacity;
+    static std::atomic<uint64_t> next_lane_id{1};
+    auto lane = std::make_unique<llama_context>(model, params, memory);
+    lane->execution_lane_id = next_lane_id.fetch_add(1);
+    return lane;
 }
 
 llama_context::~llama_context() {
@@ -913,6 +963,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    if (cparams.independent_execution) {
+        ggml_backend_sched_set_owned_inputs(sched.get(), true);
+        ggml_backend_sched_enable_transport_profile(sched.get());
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -928,7 +982,9 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    // Private workers execute one sequence; n_seq_max remains the shared
+    // address range, not the number of simultaneous graph sequences.
+    const uint32_t n_seqs = cparams.independent_execution ? 1 : cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -955,10 +1011,10 @@ void llama_context::sched_reserve() {
     llama_memory_context_ptr mctx_glm_dense;
     uint32_t glm_dense_n_kv = 0;
     if (model.arch == LLM_ARCH_GLM5NEXT && cparams.glm5next_sparse_query_chunk > 0 &&
-            n_seqs == 1 && cparams.n_ctx_seq >= 256 && !model.hparams.no_alloc) {
+            (n_seqs == 1 || cparams.kv_unified) && cparams.n_ctx_seq >= 256 && !model.hparams.no_alloc) {
         const auto & hparams = model.hparams;
         const auto sparse_geometry = [&](uint32_t n_kv) {
-            const uint64_t n_pools = llama_kpool_n_pools(n_kv, hparams.indexer_kpool, 1);
+            const uint64_t n_pools = llama_kpool_n_pools(n_kv, hparams.indexer_kpool, n_seqs);
             const uint64_t n_select = (uint64_t) hparams.indexer_kpool*llama_kpool_select_k(
                     n_pools, hparams.indexer_top_k, hparams.indexer_kpool);
             const uint64_t n_padded = GGML_PAD(n_select + hparams.indexer_kpool - 1, 256);
@@ -1119,7 +1175,7 @@ void llama_context::sched_reserve() {
         }
         const int64_t n_tokens_pp = std::min(cparams.n_ctx, cparams.n_ubatch);
         const auto & hparams = model.hparams;
-        const int64_t n_pools_pp = llama_kpool_n_pools(cparams.n_ctx_seq, hparams.indexer_kpool, 1);
+        const int64_t n_pools_pp = llama_kpool_n_pools(cparams.n_ctx_seq, hparams.indexer_kpool, n_seqs);
         const int64_t n_select_pp = hparams.indexer_kpool*llama_kpool_select_k(
                 n_pools_pp, hparams.indexer_top_k, hparams.indexer_kpool);
         const int64_t n_padded_pp = GGML_PAD(n_select_pp + hparams.indexer_kpool - 1, 256);
@@ -1571,7 +1627,9 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        // Private workers execute one sequence; n_seq_max remains the shared
+        // address range, not the number of simultaneous graph sequences.
+        const uint32_t n_seqs = cparams.independent_execution ? 1 : cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -2369,6 +2427,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
+    const int64_t execution_prepare_start = execution_wave_active ? ggml_time_us() : 0;
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -2430,6 +2490,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    if (execution_wave_active) execution_profile[7].fetch_add(ggml_time_us() - execution_prepare_start, std::memory_order_relaxed);
+    const int64_t execution_inputs_start = execution_wave_active ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -2446,7 +2509,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (execution_wave_active) execution_profile[6].fetch_add(ggml_time_us() - execution_inputs_start, std::memory_order_relaxed);
+    if (execution_input_validator) execution_input_validator(*res);
+    if (execution_dispatch_begin) execution_dispatch_begin();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (execution_dispatch_end) execution_dispatch_end();
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2818,7 +2885,7 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (!execution_wave_active) memory_update(false);
 
     llama_memory_context_ptr mctx;
 
@@ -2840,7 +2907,7 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
-                    if (!did_optimize) {
+                    if (!did_optimize && !execution_wave_active) {
                         did_optimize = true;
 
                         if (memory_update(true)) {
@@ -2937,6 +3004,19 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        // Outputs and route telemetry belong to this lane. Their host transfers
+        // may wait for the GPU; never hold shared-memory planning across them.
+        if (execution_dispatch_begin) execution_dispatch_begin();
+
+        static const bool ready_readback = [] {
+            const char * value = std::getenv("LLAMA_EXECUTION_READY_READBACK");
+            return value != nullptr && std::atoi(value) != 0;
+        }();
+        if (cparams.independent_execution && ready_readback) {
+            // Keep unfinished readbacks off shared copy engines; only this worker waits.
+            ggml_backend_sched_synchronize(sched.get());
+        }
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
@@ -3095,6 +3175,7 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        if (execution_dispatch_end) execution_dispatch_end();
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3353,7 +3434,7 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::extract_moe_routes(const llm_graph_result * res) {
-    constexpr size_t MAX_PENDING_BYTES = 16u * 1024u * 1024u;
+    constexpr size_t MAX_PENDING_BYTES = MOE_ROUTE_PENDING_LIMIT;
 
     if (!cparams.moe_route_stats || res->t_moe_routes.empty()) {
         return;
@@ -3362,6 +3443,8 @@ void llama_context::extract_moe_routes(const llm_graph_result * res) {
     struct route_copy {
         ggml_tensor * tensor;
         ggml_backend_t backend;
+        ggml_tensor * weights;
+        ggml_backend_t weights_backend;
         int32_t layer;
         size_t n_used;
         size_t n_tokens;
@@ -3397,20 +3480,29 @@ void llama_context::extract_moe_routes(const llm_graph_result * res) {
             moe_route_stats.note_dropped(batch_route_rows);
             return;
         }
-        const size_t bytes = n_used * n_tokens * sizeof(int32_t);
+        const auto weight_it = res->t_moe_route_weights.find(layer);
+        ggml_tensor * weights = weight_it == res->t_moe_route_weights.end() ? nullptr : weight_it->second;
+        if (!weights || weights->type != GGML_TYPE_F32 || weights->ne[0] != 1 ||
+                weights->ne[1] != (int64_t) n_used || weights->ne[2] != (int64_t) n_tokens ||
+                weights->ne[3] != 1 || weights->nb[1] != sizeof(float)) {
+            moe_route_stats.note_dropped(batch_route_rows);
+            return;
+        }
+        const size_t bytes = n_used * n_tokens * (sizeof(int32_t) + sizeof(float));
         if (batch_bytes > MAX_PENDING_BYTES || bytes > MAX_PENDING_BYTES - batch_bytes) {
             moe_route_stats.note_dropped(batch_route_rows);
             return;
         }
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
-        if (backend == nullptr) {
+        ggml_backend_t weights_backend = ggml_backend_sched_get_tensor_backend(sched.get(), weights);
+        if (backend == nullptr || weights_backend == nullptr) {
             LLAMA_LOG_WARN("%s: dropping route telemetry ubatch: route tensor has no backend\n", __func__);
             moe_route_stats.note_dropped(batch_route_rows);
             return;
         }
 
-        copies.push_back({ tensor, backend, layer, n_used, n_tokens, bytes });
+        copies.push_back({ tensor, backend, weights, weights_backend, layer, n_used, n_tokens, bytes });
         batch_bytes += bytes;
     }
 
@@ -3419,6 +3511,9 @@ void llama_context::extract_moe_routes(const llm_graph_result * res) {
         return;
     }
 
+    GGML_ASSERT(buf_moe_routes && ggml_backend_buffer_get_size(buf_moe_routes.get()) >= MAX_PENDING_BYTES);
+    auto * arena = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf_moe_routes.get()));
+    size_t next_offset = moe_route_pending_bytes;
     std::vector<moe_route_snapshot *> destinations;
     destinations.reserve(copies.size());
     for (const auto & copy : copies) {
@@ -3427,17 +3522,26 @@ void llama_context::extract_moe_routes(const llm_graph_result * res) {
         snapshot.layer = copy.layer;
         snapshot.n_used = copy.n_used;
         snapshot.n_tokens = copy.n_tokens;
-        snapshot.ids.resize(copy.n_used * copy.n_tokens);
+        const size_t count = copy.n_used * copy.n_tokens;
+        snapshot.ids = {reinterpret_cast<int32_t *>(arena + next_offset), count};
+        next_offset += count * sizeof(int32_t);
+        snapshot.weights = {reinterpret_cast<float *>(arena + next_offset), count};
+        next_offset += count * sizeof(float);
         destinations.push_back(&snapshot);
     }
-    moe_route_pending_bytes += batch_bytes;
+    GGML_ASSERT(next_offset == moe_route_pending_bytes + batch_bytes);
+    moe_route_pending_bytes = next_offset;
 
     for (size_t i = 0; i < copies.size(); ++i) {
         const auto & copy = copies[i];
         ggml_backend_tensor_get_2d_async(
-                copy.backend, copy.tensor, destinations[i]->ids.data(), 0,
+                copy.backend, copy.tensor, destinations[i]->ids.data, 0,
                 copy.n_used * sizeof(int32_t), copy.n_tokens,
                 copy.tensor->nb[1], copy.n_used * sizeof(int32_t));
+        ggml_backend_tensor_get_2d_async(
+                copy.weights_backend, copy.weights, destinations[i]->weights.data, 0,
+                copy.n_used * sizeof(float), copy.n_tokens,
+                copy.weights->nb[2], copy.n_used * sizeof(float));
     }
 }
 
@@ -3447,7 +3551,7 @@ void llama_context::consume_moe_routes() {
     }
 
     for (const auto & snapshot : moe_route_pending) {
-        if (!moe_route_stats.add(snapshot.layer, snapshot.ids.data(), snapshot.n_used, snapshot.n_tokens)) {
+        if (!moe_route_stats.add(snapshot.layer, snapshot.ids.data, snapshot.n_used, snapshot.n_tokens, snapshot.weights.data)) {
             moe_route_stats.note_dropped(snapshot.n_tokens);
         }
     }
@@ -3457,6 +3561,24 @@ void llama_context::consume_moe_routes() {
 }
 
 void llama_context::report_moe_routes() {
+#ifndef _WIN32
+    const char * snapshot_dir = std::getenv("LLAMA_GLM5NEXT_ROUTE_STATS_DIR");
+    const int64_t now_us = ggml_time_us();
+    if (snapshot_dir && snapshot_dir[0] == '/' && now_us >= moe_route_next_snapshot_us) {
+        moe_route_next_snapshot_us = now_us + 30000000;
+        const char * role = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target";
+        const std::string lane = execution_lane_id ? "-lane" + std::to_string(execution_lane_id) : "";
+        const std::string path = std::string(snapshot_dir) + "/routes-" + std::to_string(getpid()) + lane + "-" + role + ".json";
+        const std::string temporary = path + ".tmp";
+        std::ofstream file(temporary, std::ios::trunc);
+        file << moe_route_stats.snapshot_json(role);
+        file.close();
+        if (!file || std::rename(temporary.c_str(), path.c_str()) != 0) {
+            std::remove(temporary.c_str());
+            LLAMA_LOG_WARN("%s: route snapshot write failed\n", __func__);
+        }
+    }
+#endif
     constexpr uint64_t REPORT_INTERVAL = 65536;
     constexpr size_t TOP_EXPERTS = 16;
     constexpr size_t TOP_PAIRS = 32;
@@ -3900,6 +4022,25 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    static const bool gpu_priority = [] {
+        const char * value = std::getenv("LLAMA_EXECUTION_GPU_PRIORITY");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    if (cparams.independent_execution && gpu_priority) {
+        for (auto * backend : backend_ptrs) {
+            auto * device = ggml_backend_get_device(backend);
+            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+            auto * reg = ggml_backend_dev_backend_reg(device);
+            using set_priority_fn = void (*)(ggml_backend_t, bool);
+            auto set_priority = reinterpret_cast<set_priority_fn>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_compute_priority"));
+            if (!set_priority) {
+                LLAMA_LOG_ERROR("%s: requested compute priority unavailable on %s\n", __func__, ggml_backend_name(backend));
+                return GGML_STATUS_FAILED;
+            }
+            set_priority(backend, !batched);
+        }
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -4179,6 +4320,378 @@ private:
     };
     std::vector<read_info> rinfos;
 };
+
+
+
+int llama_context::decode_with_execution_lanes(
+        const llama_batch & batch, const std::vector<llama_context *> & lanes,
+        const std::vector<std::pair<llama_context *, llama_batch>> & additional,
+        execution_completion completed, execution_wait wait_idle) {
+    last_execution_wave_lanes = 0;
+    execution_fallback.clear();
+    auto fallback = [&](const char * reason) {
+        execution_fallback = reason;
+        for (const auto & item : additional) {
+            // Unsupported adapters/output modes belong to the coordinating
+            // context; private lanes deliberately retain their decode profile.
+            const int status = decode(item.second);
+            synchronize();
+            if (status) return -3;
+        }
+        const int status = batch.n_tokens ? decode(batch) : 0;
+        // Media may already have committed; no whole-batch retry is safe.
+        return status && !additional.empty() ? -3 : status;
+    };
+    if (batch.n_tokens && (!batch.token || batch.embd || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits ||
+            batch.n_tokens < 0 || (uint32_t) batch.n_tokens > cparams.n_batch)) {
+        return fallback("batch_format");
+    }
+    if (cparams.embeddings || cparams.embeddings_nextn || !hidden_state_layers.empty() ||
+            !sampling.samplers.empty() || !loras->empty()) {
+        return fallback("outputs_or_adapters");
+    }
+    for (uint32_t layer = 0; layer < model.hparams.n_layer(); ++layer) {
+        if (cvec->tensor_for(layer)) return fallback("control_vector");
+    }
+
+    std::map<llama_seq_id, std::vector<int32_t>> indices;
+    uint32_t outputs = 0;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || !batch.seq_id[i]) return fallback("shared_batch_token");
+        const auto seq = batch.seq_id[i][0];
+        if (seq < 0 || (size_t) seq >= lanes.size() || !lanes[seq]) return fallback("missing_lane");
+        auto & rows = indices[seq];
+        if (!rows.empty() && batch.pos[i] != batch.pos[rows.back()] + 1) return fallback("noncontiguous_positions");
+        rows.push_back(i);
+        outputs += batch.logits[i] != 0;
+    }
+    if (indices.empty() && additional.empty()) return 0;
+    for (const auto & entry : indices) {
+        if (entry.second.size() > lanes[entry.first]->cparams.n_batch) return fallback("lane_batch_capacity");
+    }
+
+    struct owned_batch {
+        llama_batch value;
+        explicit owned_batch(int count) : value(llama_batch_init(count, 0, 1)) {}
+        ~owned_batch() { llama_batch_free(value); }
+    };
+    std::vector<std::unique_ptr<owned_batch>> batches;
+    std::vector<std::pair<llama_context *, llama_batch>> work;
+    for (const auto & entry : indices) {
+        auto owned = std::make_unique<owned_batch>(entry.second.size());
+        auto & sub = owned->value;
+        for (const auto i : entry.second) {
+            const int j = sub.n_tokens++;
+            sub.token[j] = batch.token[i];
+            sub.pos[j] = batch.pos[i];
+            sub.n_seq_id[j] = 1;
+            sub.seq_id[j][0] = entry.first;
+            sub.logits[j] = batch.logits[i];
+        }
+        work.emplace_back(lanes[entry.first], sub);
+        batches.push_back(std::move(owned));
+    }
+    work.insert(work.end(), additional.begin(), additional.end());
+    synchronize();
+    if (output_reserve(outputs) < outputs) return -2;
+    const int64_t started = ggml_time_us();
+    std::set<llama_context *> continued;
+    const auto result = decode_execution_wave(work, [&](llama_context * lane, llama_batch & next) {
+        const bool again = completed && completed(lane, next);
+        if (again) continued.insert(lane);
+        return again;
+    }, std::move(wait_idle));
+    // Other lanes may have committed their tails; never retry the whole batch.
+    for (const int status : result) if (status) return -3;
+
+    output_swaps.clear();
+    std::fill(output_ids.begin(), output_ids.end(), -1);
+    std::map<int32_t, std::pair<llama_context *, int32_t>> output_sources;
+    for (const auto & entry : indices) {
+        if (continued.count(lanes[entry.first])) continue;
+        for (size_t j = 0; j < entry.second.size(); ++j) {
+            const auto i = entry.second[j];
+            if (batch.logits[i]) output_sources.emplace(i, std::make_pair(lanes[entry.first], j));
+        }
+    }
+    n_outputs = 0;
+    const size_t n_vocab = model.vocab.n_tokens();
+    for (const auto & entry : output_sources) {
+        const float * source = entry.second.first->get_logits_ith(entry.second.second);
+        if (!source) return -3;
+        std::copy_n(source, n_vocab, logits.data + n_outputs*n_vocab);
+        output_ids[entry.first] = n_outputs++;
+    }
+    t_compute_start_us = started;
+    n_queued_tokens = batch.n_tokens;
+    synchronize();
+    if (last_execution_wave_lanes == 0) execution_fallback = "pooled_key_rebuild";
+    return 0;
+}
+
+std::vector<int> llama_context::decode_execution_wave(
+        const std::vector<std::pair<llama_context *, llama_batch>> & work,
+        execution_completion completed, execution_wait wait_idle) {
+    last_execution_wave_lanes = 0;
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!hybrid || model.arch != LLM_ARCH_GLM5NEXT || work.empty()) {
+        throw std::invalid_argument("execution wave requires GLM hybrid memory and nonempty work");
+    }
+    std::set<llama_context *> contexts;
+    std::set<llama_seq_id> sequences;
+    for (const auto & item : work) {
+        auto * lane = item.first;
+        const auto & batch = item.second;
+        if (!lane || lane->memory != memory || !lane->cparams.independent_execution ||
+                lane->execution_wave_active || batch.n_tokens <= 0 ||
+                (uint32_t) batch.n_tokens > lane->cparams.n_batch ||
+                (!batch.token && !batch.embd) || (batch.token && batch.embd) ||
+                !batch.pos || !batch.n_seq_id || !batch.seq_id ||
+                !contexts.insert(lane).second) {
+            throw std::invalid_argument("invalid execution lane or batch");
+        }
+        if (batch.n_seq_id[0] != 1 || !batch.seq_id[0]) {
+            throw std::invalid_argument("execution wave requires explicit sequence IDs");
+        }
+        const llama_seq_id seq = batch.seq_id[0][0];
+        if (seq < 0 || (uint32_t) seq >= cparams.n_seq_max || !sequences.insert(seq).second) {
+            throw std::invalid_argument("execution wave sequences must be disjoint");
+        }
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] != 1 || !batch.seq_id[i] || batch.seq_id[i][0] != seq ||
+                    batch.pos[i] != batch.pos[0] + i) {
+                throw std::invalid_argument("execution lane requires one contiguous sequence");
+            }
+        }
+    }
+    synchronize();
+    for (auto * lane : contexts) lane->synchronize();
+    memory_update(false);
+    synchronize();
+
+    // Snapshot every aliased recurrent endpoint before restoring any of them.
+    auto * recurrent = hybrid->get_mem_recr();
+    std::map<llama_seq_id, std::vector<uint8_t>> snapshots;
+    bool has_moved_sources = false;
+    for (const auto & cell : recurrent->cells) {
+        if (!cell.is_empty() && cell.src >= 0 &&
+                &cell != &recurrent->cells.at(cell.src)) has_moved_sources = true;
+    }
+    std::set<llama_seq_id> materialize = sequences;
+    if (has_moved_sources) {
+        for (const auto & cell : recurrent->cells) {
+            materialize.insert(cell.seq_id.begin(), cell.seq_id.end());
+        }
+    }
+    for (const auto seq : materialize) {
+        const int tail = recurrent->cells.at(seq).tail;
+        if (tail < 0) continue;
+        const auto & cell = recurrent->cells.at(tail);
+        if (!has_moved_sources && cell.seq_id.size() == 1 && cell.src == tail) continue;
+        llama_io_write_dummy count(false);
+        recurrent->state_write(count, seq);
+        auto & bytes = snapshots[seq];
+        bytes.resize(count.n_bytes());
+        llama_io_write_host writer(bytes.data(), bytes.size());
+        recurrent->state_write(writer, seq);
+    }
+    for (auto & entry : snapshots) {
+        llama_io_read_host reader(entry.second.data(), entry.second.size());
+        recurrent->state_read(reader, entry.first);
+    }
+
+    // Rebuilding pooled keys can write shared prefix rows. Settle that work first.
+    if (hybrid->get_mem_attn()->get_kpool_dirty()) {
+        std::vector<int> results;
+        for (const auto & item : work) {
+            results.push_back(item.first->decode(item.second));
+            item.first->synchronize();
+        }
+        return results;
+    }
+
+    std::mutex planning;
+    // Each lane owns its batch storage until its last completion. All shared
+    // memory planning is serialized; GPU execution and completion are independent.
+    auto pending = work;
+    std::vector<int32_t> offsets(work.size(), 0);
+    std::vector<llama_batch> submitted(work.size());
+    std::vector<std::map<int32_t, std::vector<float>>> collected(work.size());
+    const size_t vocab_size = model.vocab.n_tokens();
+    std::vector<std::future<int>> futures(work.size());
+    std::vector<int> results(work.size(), 0);
+    std::vector<bool> finished(work.size(), false);
+    std::mutex completion_mutex;
+    std::condition_variable completion_ready;
+    size_t in_flight = 0;
+    auto launch = [&](size_t index) {
+        auto item = pending[index];
+        auto & chunk = item.second;
+        const int32_t offset = offsets[index];
+        chunk.n_tokens = std::min<int32_t>(chunk.n_tokens - offset, item.first->cparams.n_ubatch);
+        if (chunk.token) chunk.token += offset;
+        if (chunk.embd) chunk.embd += (size_t) offset * model.hparams.n_embd_inp();
+        chunk.pos += offset;
+        chunk.n_seq_id += offset;
+        chunk.seq_id += offset;
+        if (chunk.logits) chunk.logits += offset;
+        submitted[index] = chunk;
+        futures[index] = std::async(std::launch::async, [&, item, index]() {
+            auto * lane = item.first;
+            int64_t waiting_since = ggml_time_us();
+            std::unique_lock<std::mutex> lock(planning);
+            int64_t held_since = ggml_time_us();
+            lane->execution_profile[1].fetch_add(held_since - waiting_since, std::memory_order_relaxed);
+            int64_t dispatched_since = 0;
+            unsigned dispatch_segment = 0;
+            const auto transport_before = ggml_backend_sched_get_transport_profile(lane->sched.get());
+            lane->execution_wave_active = true;
+            lane->execution_dispatch_begin = [&]() {
+                dispatched_since = ggml_time_us();
+                lane->execution_profile[2].fetch_add(dispatched_since - held_since, std::memory_order_relaxed);
+                lock.unlock();
+            };
+            lane->execution_dispatch_end = [&]() {
+                waiting_since = ggml_time_us();
+                // One graph and then one output-transfer segment per bounded lane batch.
+                lane->execution_profile[dispatch_segment++ % 2 == 0 ? 3 : 4].fetch_add(
+                    waiting_since - dispatched_since, std::memory_order_relaxed);
+                lock.lock();
+                held_since = ggml_time_us();
+                lane->execution_profile[1].fetch_add(held_since - waiting_since, std::memory_order_relaxed);
+            };
+            int result = -3;
+            try {
+                result = lane->decode(item.second);
+            } catch (...) {
+                if (!lock.owns_lock()) lane->execution_dispatch_end();
+            }
+            lane->execution_dispatch_begin = {};
+            lane->execution_dispatch_end = {};
+            lane->execution_wave_active = false;
+            lane->execution_profile[2].fetch_add(ggml_time_us() - held_since, std::memory_order_relaxed);
+            lock.unlock();
+            const int64_t sync_start = ggml_time_us();
+            try { lane->synchronize(); } catch (...) { result = -3; }
+            lane->execution_profile[5].fetch_add(ggml_time_us() - sync_start, std::memory_order_relaxed);
+            // Scheduler fields are only read by their owning worker. HTTP readers
+            // see relaxed atomics, never live mutable scheduler accounting.
+            const auto transport_after = ggml_backend_sched_get_transport_profile(lane->sched.get());
+            for (size_t i = 0; i < GGML_SCHED_TRANSPORT_PROFILE_FIELDS; ++i) {
+                const auto before = transport_before.values[i], after = transport_after.values[i];
+                lane->execution_profile[8 + i].fetch_add(after >= before ? after - before : after,
+                        std::memory_order_relaxed);
+            }
+            lane->execution_profile[0].fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> done(completion_mutex);
+                finished[index] = true;
+            }
+            completion_ready.notify_one();
+            return result;
+        });
+        ++in_flight;
+    };
+    try {
+        for (size_t i = 0; i < work.size(); ++i) launch(i);
+    } catch (...) {
+        for (auto & future : futures) if (future.valid()) future.get();
+        throw;
+    }
+    bool failed = false;
+    try {
+        while (in_flight) {
+            auto wait = [&]() {
+                std::unique_lock<std::mutex> lock(completion_mutex);
+                completion_ready.wait(lock, [&]() {
+                    return std::any_of(finished.begin(), finished.end(), [](bool value) { return value; });
+                });
+            };
+            if (wait_idle) wait_idle(wait); else wait();
+            std::vector<size_t> ready_lanes;
+            {
+                std::lock_guard<std::mutex> lock(completion_mutex);
+                for (size_t i = 0; i < finished.size(); ++i) {
+                    if (finished[i]) {
+                        finished[i] = false;
+                        ready_lanes.push_back(i);
+                    }
+                }
+            }
+            // Discover any compute failure before permitting another submission.
+            for (const auto i : ready_lanes) {
+                results[i] = futures[i].get();
+                --in_flight;
+                failed |= results[i] != 0;
+            }
+            for (const auto i : ready_lanes) {
+                if (failed) continue;
+                auto * lane = pending[i].first;
+                const auto & chunk = submitted[i];
+                if (pending[i].second.n_tokens > (int32_t) lane->cparams.n_ubatch) {
+                    for (int32_t row = 0; row < chunk.n_tokens; ++row) {
+                        if ((chunk.logits && chunk.logits[row]) ||
+                                (!chunk.logits && offsets[i] + row + 1 == pending[i].second.n_tokens)) {
+                            const float * logits = lane->get_logits_ith(row);
+                            if (!logits) throw std::runtime_error("missing execution chunk output");
+                            collected[i][offsets[i] + row] = std::vector<float>(logits, logits + vocab_size);
+                        }
+                    }
+                    offsets[i] += chunk.n_tokens;
+                    if (offsets[i] < pending[i].second.n_tokens) {
+                        // Plan each chunk against the current shared allocator. Future
+                        // KV positions must not be planned across another lane's writes.
+                        launch(i);
+                        continue;
+                    }
+                    if (lane->output_reserve(collected[i].size()) < collected[i].size()) {
+                        throw std::runtime_error("execution chunk output allocation failed");
+                    }
+                    std::fill(lane->output_ids.begin(), lane->output_ids.end(), -1);
+                    lane->output_swaps.clear();
+                    lane->n_outputs = collected[i].size();
+                    size_t output = 0;
+                    for (const auto & row : collected[i]) {
+                        lane->output_ids[row.first] = output;
+                        std::copy(row.second.begin(), row.second.end(), lane->logits.data + output++ * vocab_size);
+                    }
+                }
+                if (completed) {
+                    auto & item = pending[i];
+                    const auto previous = item.second;
+                    const llama_pos previous_pos = previous.pos[0];
+                    const llama_seq_id previous_seq = previous.seq_id[0][0];
+                    bool again;
+                    {
+                        // A completed prompt may capture its exact shared endpoint.
+                        std::lock_guard<std::mutex> lock(planning);
+                        again = completed(item.first, item.second);
+                    }
+                    if (again) {
+                        // Continue on the same private tail, including prompt-to-decode.
+                        const auto & next = item.second;
+                        if (previous.n_tokens < 1 || !previous.token ||
+                                next.n_tokens != 1 || !next.token || next.embd ||
+                                !next.pos || next.pos[0] != previous_pos + previous.n_tokens ||
+                                !next.n_seq_id || next.n_seq_id[0] != 1 ||
+                                !next.seq_id || !next.seq_id[0] || next.seq_id[0][0] != previous_seq) {
+                            throw std::invalid_argument("invalid execution lane continuation");
+                        }
+                        offsets[i] = 0;
+                        collected[i].clear();
+                        launch(i);
+                    }
+                }
+            }
+        }
+    } catch (...) {
+        // No caller may mutate or free shared state until every graph has joined.
+        for (auto & future : futures) if (future.valid()) future.get();
+        throw;
+    }
+    last_execution_wave_lanes = work.size();
+    return results;
+}
 
 class llama_io_write_file : public llama_io_write_i {
 public:
@@ -5993,4 +6506,85 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+
+static bool glm5next_share_prefix_impl(llama_context * ctx, llama_seq_id source,
+                                llama_seq_id destination, llama_pos end, bool seed_empty) {
+    if (!ctx || ctx->get_model().arch != LLM_ARCH_GLM5NEXT ||
+            !ctx->get_cparams().kv_unified || source == destination || end <= 0 ||
+            source < 0 || destination < 0 ||
+            (uint32_t) source >= ctx->get_cparams().n_seq_max ||
+            (uint32_t) destination >= ctx->get_cparams().n_seq_max) {
+        return false;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(ctx->get_memory());
+    if (!hybrid || !hybrid->get_mem_idx()) { return false; }
+    if (seed_empty && hybrid->get_mem_recr()->seq_pos_max(destination) >= 0) { return false; }
+    std::vector<llama_kv_cache *> caches{hybrid->get_mem_attn(), hybrid->get_mem_idx()};
+    // Validate both caches before changing either. Sparse/shifted histories and
+    // incomplete in-flight endpoints are not eligible for this optimization.
+    for (auto * cache : caches) {
+        const auto & cells = cache->get_cells(source);
+        if (&cells != &cache->get_cells(destination) || end > (llama_pos) cells.size()) { return false; }
+        std::vector<uint8_t> seen_source(end), seen_destination(end);
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (seed_empty && cells.seq_has(i, destination)) { return false; }
+            const auto pos = cells.pos_get(i);
+            if (pos < 0 || pos >= end) { continue; }
+            if (cells.get_shift(i) != 0 && (cells.seq_has(i, source) || cells.seq_has(i, destination))) { return false; }
+            if (cells.seq_has(i, source) && seen_source[pos]++) { return false; }
+            if (cells.seq_has(i, destination) && seen_destination[pos]++) { return false; }
+        }
+        if (std::find(seen_source.begin(), seen_source.end(), 0) != seen_source.end() ||
+                (!seed_empty && std::find(seen_destination.begin(), seen_destination.end(), 0) != seen_destination.end())) { return false; }
+    }
+    llama_synchronize(ctx);
+    for (auto * cache : caches) {
+        cache->seq_rm(destination, 0, end);
+        cache->seq_cp(source, destination, 0, end);
+        cache->set_kpool_dirty();
+    }
+    return true;
+}
+
+bool llama_glm5next_share_prefix(llama_context * ctx, llama_seq_id source,
+                                llama_seq_id destination, llama_pos end) {
+    return glm5next_share_prefix_impl(ctx, source, destination, end, false);
+}
+
+bool llama_glm5next_seed_prefix(llama_context * ctx, llama_seq_id source,
+                               llama_seq_id destination, llama_pos end) {
+    return glm5next_share_prefix_impl(ctx, source, destination, end, true);
+}
+
+uint64_t llama_glm5next_reserved_cells(llama_context * ctx,
+        const std::vector<std::pair<llama_seq_id, uint32_t>> & budgets) {
+    if (!ctx || ctx->get_model().arch != LLM_ARCH_GLM5NEXT || !ctx->get_cparams().kv_unified) {
+        return UINT64_MAX;
+    }
+    auto * memory = dynamic_cast<llama_memory_hybrid *>(ctx->get_memory());
+    if (!memory || budgets.empty()) { return UINT64_MAX; }
+    std::vector<uint64_t> counts(budgets.size());
+    for (size_t j = 0; j < budgets.size(); ++j) {
+        if (budgets[j].first < 0 || (uint32_t) budgets[j].first >= ctx->get_cparams().n_seq_max) {
+            return UINT64_MAX;
+        }
+        for (size_t k = 0; k < j; ++k) {
+            if (budgets[k].first == budgets[j].first) { return UINT64_MAX; }
+        }
+    }
+    const auto & cells = memory->get_mem_attn()->get_cells(budgets[0].first);
+    uint64_t reserved = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        bool used = false;
+        for (size_t j = 0; j < budgets.size(); ++j) {
+            if (cells.seq_has(i, budgets[j].first)) { ++counts[j]; used = true; }
+        }
+        reserved += used;
+    }
+    for (size_t j = 0; j < budgets.size(); ++j) {
+        reserved += budgets[j].second > counts[j] ? budgets[j].second - counts[j] : 0;
+    }
+    return reserved;
 }

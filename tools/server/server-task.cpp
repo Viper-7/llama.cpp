@@ -556,6 +556,11 @@ common_chat_msg task_result_state::update_chat_msg(
 //
 json result_prompt_progress::to_json() const {
     return json {
+        {"waiting_for_prefill_workspace", waiting_for_prefill_workspace},
+        {"waiting_for_prefix", waiting_for_prefix},
+        {"prefix_producer", prefix_producer},
+        {"prefix_target_tokens", prefix_target_tokens},
+        {"prefix_published_tokens", prefix_published_tokens},
         {"total",     total},
         {"cache",     cache},
         {"processed", processed},

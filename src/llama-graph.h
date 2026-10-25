@@ -998,6 +998,7 @@ public:
     std::vector<ggml_tensor *> t_candidates;
     std::map<int32_t, ggml_tensor *> t_hidden_states;
     std::map<int32_t, ggml_tensor *> t_moe_routes;
+    std::map<int32_t, ggml_tensor *> t_moe_route_weights;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;

@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <cmath>
+#include <sstream>
+#include <iomanip>
 
 namespace {
 
@@ -25,7 +28,7 @@ bool llama_moe_route_stats::configure(uint32_t n_layers, uint32_t n_experts) {
     }
 
     const size_t n_pairs = (size_t) n_experts * (n_experts - 1) / 2;
-    const size_t counters_per_layer = (size_t) n_experts + n_pairs;
+    const size_t counters_per_layer = (size_t) n_experts * 4 + n_pairs;
     if (counters_per_layer > ROUTE_STATS_MAX_BYTES / sizeof(uint64_t) / n_layers) {
         return false;
     }
@@ -49,7 +52,7 @@ size_t llama_moe_route_stats::pair_index(uint32_t a, uint32_t b, uint32_t n_expe
 }
 
 bool llama_moe_route_stats::add(
-        int32_t layer, const int32_t * ids, size_t n_used, size_t n_tokens) {
+        int32_t layer, const int32_t * ids, size_t n_used, size_t n_tokens, const float * weights) {
     if (!enabled() || layer < 0 || (uint32_t) layer >= n_layers_ || ids == nullptr ||
             n_used == 0 || n_used > ROUTE_STATS_MAX_USED) {
         return false;
@@ -58,6 +61,9 @@ bool llama_moe_route_stats::add(
     auto & stats = layers_[layer];
     if (stats.expert_hits.empty()) {
         stats.expert_hits.resize(n_experts_);
+        stats.q1_hits.resize(n_experts_);
+        stats.multi_hits.resize(n_experts_);
+        stats.weight_sums.resize(n_experts_);
         stats.coactivations.resize((size_t) n_experts_ * (n_experts_ - 1) / 2);
     }
 
@@ -84,6 +90,15 @@ bool llama_moe_route_stats::add(
             if (std::find(selected.begin(), selected.end(), (uint32_t) id) == selected.end()) {
                 selected.push_back((uint32_t) id);
                 add_saturating(stats.expert_hits[id]);
+                add_saturating(n_tokens == 1 ? stats.q1_hits[id] : stats.multi_hits[id]);
+                if (weights) {
+                    const float weight = weights[row * n_used + rank];
+                    if (std::isfinite(weight) && weight >= 0) {
+                        stats.weight_sums[id] += weight;
+                    } else {
+                        add_saturating(stats.invalid_weights);
+                    }
+                }
             }
         }
 
@@ -94,6 +109,7 @@ bool llama_moe_route_stats::add(
             }
         }
         add_saturating(stats.routed_tokens);
+        add_saturating(n_tokens == 1 ? stats.q1_rows : stats.multi_rows);
         add_saturating(routed_tokens_);
     }
     if (!batch_hits.empty()) {
@@ -124,4 +140,35 @@ bool llama_moe_route_stats::add(
 
 void llama_moe_route_stats::note_dropped(uint64_t route_rows) {
     add_saturating(dropped_route_rows_, route_rows);
+}
+
+std::string llama_moe_route_stats::snapshot_json(const char * context) const {
+    std::ostringstream out;
+    out << std::setprecision(17);
+    out << "{\"schema\":1,\"context\":\"" << (std::string(context) == "draft" ? "draft" : "target")
+        << "\",\"routed_layer_rows\":" << routed_tokens_ << ",\"dropped_layer_rows\":" << dropped_route_rows_
+        << ",\"experts\":" << n_experts_ << ",\"layers\":[";
+    bool first = true;
+    for (const auto & entry : layers_) {
+        if (!first) { out << ','; }
+        first = false;
+        const auto & s = entry.second;
+        out << "{\"layer\":" << entry.first << ",\"rows\":" << s.routed_tokens
+            << ",\"q1_rows\":" << s.q1_rows << ",\"multi_rows\":" << s.multi_rows
+            << ",\"invalid_ids\":" << s.invalid_ids << ",\"invalid_weights\":" << s.invalid_weights;
+        auto array = [&](const char * name, const auto & values) {
+            out << ",\"" << name << "\":[";
+            for (size_t i = 0; i < values.size(); ++i) { if (i) { out << ','; } out << values[i]; }
+            out << ']';
+        };
+        array("hits", s.expert_hits);
+        array("q1_hits", s.q1_hits);
+        array("multi_hits", s.multi_hits);
+        array("applied_weight_sums", s.weight_sums);
+        array("small_batch_calls", s.small_batch_calls);
+        array("small_batch_distinct_experts", s.small_batch_distinct_experts);
+        out << '}';
+    }
+    out << "]}\n";
+    return out.str();
 }
