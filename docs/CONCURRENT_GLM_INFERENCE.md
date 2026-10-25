@@ -1,6 +1,6 @@
 # Concurrent GLM execution
 
-This extends the existing cache-rocm branch. The upstream integration remains at 8baabd53b; concurrency behavior comes from production source 85ce7b07d and is adapted to the newer batch, scheduler and multimodal APIs. The public port has its own validation; production-lineage measurements must not be treated as measurements of a different build.
+This extends the existing cache-rocm branch. The upstream integration is at 1a0b56cec (100 commits beyond the earlier 8baabd53b base); concurrency behavior comes from production source 85ce7b07d and is adapted to the newer batch, scheduler and multimodal APIs. The public port has its own validation; production-lineage measurements must not be treated as measurements of a different build.
 
 ## Execution model
 
@@ -84,7 +84,7 @@ The HTTP fixtures explicitly override their tiny model's advertised context to
 4096 positions. This permits long synthetic sequences under the newer server's
 training-context cap; it is not a recommendation to override real model limits.
 
-## Public integration validation (2026-10-25)
+## Initial public integration validation (d9595f1fc, 2026-10-25)
 
 The integrated source was built in Release mode with HIP and CUDA disabled.
 Checks included the GLM fork architecture suite, the upstream Llama architecture
@@ -114,3 +114,34 @@ An identical image reused 1193 tokens; changed image content reused only the
 This publication did not replace the production server or run the integrated
 public source on the production GPUs. Prior MI50 measurements apply to the
 production source lineage, not to this newly integrated binary.
+
+
+## Upstream synchronization (2026-10-25)
+
+Upstream `1a0b56cec73dac938e0602c974b21dc8e2862830` adds 100 commits after
+the previous upstream base. This is a history-preserving merge into `cache-rocm`.
+The integration retains the fork's GLM execution workers, cache dependencies,
+external-media adapter and instrumentation.
+
+Conflict resolution preserves upstream's chunked CUDA graphs, fused top-k mask,
+new model architectures, tokenizer whitespace behavior and server role split.
+The fork's graph diagnostics and internal cache routes follow the new APIs.
+DeepSeek 4.1 attention calls explicitly select the ordinary, non-Turbo3 basis.
+The fork RPC patch version is incremented for the combined operation table.
+
+ROCm 6.3.3 / gfx906 host-and-device syntax checks passed for `ggml-cuda.cu`,
+`mmq.cu`, `top-k-mask.cu` and `topk-moe.cu`, with HIP graphs enabled.
+These are compile checks, not GPU execution or full HIP link validation.
+
+
+The merged Release CPU build passed the fork GLM architecture/state suite,
+upstream Llama and DeepSeek 4.1 architecture fixtures, deferred mock-GPU input
+ownership/transfer ordering, bounded router statistics, and all 28 upstream
+TOP_K_MASK cases. All eight storage regressions passed.
+
+The six-worker HTTP suite retained exact serial output, worker reassignment,
+capacity parking, cancellation isolation and shared-head reuse (556 physical
+cells for 3116 logical cells). Prefix-producer cancellation/reuse, image/text
+and image/image overlap, queued media preparation, image cache identity, and
+RAM-preserving/SSD-only restart recovery also passed. This validation used only
+synthetic CPU fixtures; production runtime and GPU qualification are unchanged.

@@ -147,7 +147,7 @@ Priority is `interactive` or `background`; lifecycle is `retained`, `ephemeral` 
 
 ## Reproducing the cache checks
 
-The fork retains its upstream integration at `8baabd53b77d1c48c6ef8d3b620436292f3f6231`. Concurrency changes were ported from production source `85ce7b07da2e6d733ea2f39653d6b952a19e65f9` onto that base. The CPU storage suite, synthetic GLM target/draft state tests, and HTTP restart tests are independent of the large reference model. The HTTP test checks cold prefill, live reuse, process restart with tmpfs intact, and recovery after deleting its temporary RAM cache while retaining SSD backups. It asserts identical output and restored-token counts.
+The fork includes upstream through `1a0b56cec73dac938e0602c974b21dc8e2862830`, merging 100 commits after the previous `8baabd53b` base. Concurrency changes originated in production source `85ce7b07da2e6d733ea2f39653d6b952a19e65f9` and remain integrated with the newer upstream APIs. The CPU storage suite, synthetic GLM target/draft state tests, and HTTP restart tests are independent of the large reference model. The HTTP test checks cold prefill, live reuse, process restart with tmpfs intact, and recovery after deleting its temporary RAM cache while retaining SSD backups. It asserts identical output and restored-token counts.
 
 ```sh
 cmake -S . -B build-cpu -DGGML_HIP=OFF -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON

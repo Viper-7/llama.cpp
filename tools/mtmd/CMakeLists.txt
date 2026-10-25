@@ -56,6 +56,7 @@ add_library(mtmd
             models/paddleocr.cpp
             models/pixtral.cpp
             models/qwen2vl.cpp
+            models/sensenova-u1.cpp
             models/minimax-m3.cpp
             models/qwen3vl.cpp
             models/ling3vl.cpp
@@ -67,6 +68,7 @@ add_library(mtmd
             models/pockettts-seanet.cpp
             models/pockettts-spkenc.cpp
             models/pockettts-gen.cpp
+            models/soprano.cpp
             models/step3vl.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
